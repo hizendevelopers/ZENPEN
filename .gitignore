@@ -1,0 +1,13 @@
+.env
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.log
+backend/server_stdout.log
+backend/server_stderr.log
+backend/test_tone.wav
+backend/.cache/
+node_modules/
+dist/
+build/

@@ -7,6 +7,7 @@ __pycache__/
 backend/server_stdout.log
 backend/server_stderr.log
 backend/test_tone.wav
+backend/tmp_download_test/
 backend/.cache/
 node_modules/
 dist/

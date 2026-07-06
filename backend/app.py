@@ -646,7 +646,7 @@ def download_audio_via_apify(url: str, output_dir: str) -> str:
     client = apify_client_class(APIFY_TOKEN)
     run_input = {
         "videos": [{"url": url}],
-        "storeInKVStore": None,
+        "storeInKVStore": False,
         "preferredQuality": None,
         "preferredFormat": "mp3",
         "filenameTemplateParts": None,

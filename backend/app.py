@@ -667,7 +667,15 @@ def infer_download_suffix(download_url: str, fallback: str = ".mp3") -> str:
 
 def download_file_to_path(download_url: str, destination: Path) -> Path:
     with httpx.stream("GET", download_url, follow_redirects=True, timeout=120.0) as response:
-        response.raise_for_status()
+        if response.status_code >= 400:
+            text = response.text.strip()
+            preview = text[:300] if text else f"HTTP {response.status_code}"
+            raise RuntimeError(f"Media download failed from upstream ({response.status_code}): {preview}")
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "application/json" in content_type or "text/plain" in content_type:
+            text = response.text.strip()
+            if text and len(text) < 500 and "upstream error" in text.lower():
+                raise RuntimeError(f"Media download failed from upstream: {text}")
         with destination.open("wb") as file_handle:
             for chunk in response.iter_bytes():
                 file_handle.write(chunk)
@@ -747,13 +755,18 @@ def download_audio_via_apify(url: str, output_dir: str) -> str:
     if not download_url and key_value_store_id:
         download_url = select_apify_kv_media_url(str(key_value_store_id))
     if not download_url:
-        raise RuntimeError("Apify actor completed, but no downloadable file URL was returned from the dataset or key-value store.")
+        raise RuntimeError(
+            "Apify actor completed, but no downloadable file URL was returned from the dataset or key-value store."
+        )
 
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     suffix = infer_download_suffix(download_url, fallback=".mp3")
     downloaded_path = output_dir_path / f"apify-download{suffix}"
-    download_file_to_path(download_url, downloaded_path)
+    try:
+        download_file_to_path(download_url, downloaded_path)
+    except Exception as exc:
+        raise RuntimeError(f"Apify returned a download URL, but the media fetch failed: {exc}") from exc
 
     if suffix in {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".opus", ".webm"}:
         return str(downloaded_path)

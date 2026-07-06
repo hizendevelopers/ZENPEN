@@ -1,0 +1,17 @@
+.git
+.gitignore
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+backend/.cache
+backend/tmp_download_test
+backend/server_stdout.log
+backend/server_stderr.log
+backend/uvicorn.err.log
+backend/uvicorn.out.log
+supabase

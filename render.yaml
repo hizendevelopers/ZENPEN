@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: zenpen
+    runtime: docker
+    plan: starter
+    autoDeploy: true

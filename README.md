@@ -25,3 +25,24 @@ Notes:
 docker build -t zenpen .
 docker run -p 8000:8000 zenpen
 ```
+
+## Recommended cloud deployment
+
+This app uses heavy Python/media dependencies such as Whisper, FFmpeg, MoviePy, FAISS, and sentence-transformers. Those are not a good fit for Vercel Serverless Functions.
+
+For a complete working deployment, use a container-friendly platform such as Render, Railway, Fly.io, or any VM/container host.
+
+### Render
+
+1. Push this repository to GitHub.
+2. Create a new Render Web Service from the repo.
+3. Render will detect [render.yaml](./render.yaml) and the [Dockerfile](./Dockerfile).
+4. Add these environment variables in Render:
+   - `GEMINI_API_KEY`
+   - `SUPABASE_URL`
+   - `SUPABASE_PUBLISHABLE_KEY`
+   - `SUPABASE_SECRET_KEY`
+   - `SUPABASE_JWKS_URL`
+5. Deploy.
+
+The Docker image installs `ffmpeg` and `libgomp1`, uses Python 3.11, and runs the full FastAPI app so the frontend and backend stay on the same origin.

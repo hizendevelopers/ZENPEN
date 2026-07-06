@@ -647,18 +647,8 @@ def download_audio_via_apify(url: str, output_dir: str) -> str:
     run_input = {
         "videos": [{"url": url}],
         "storeInKVStore": False,
-        "preferredQuality": None,
+        "preferredQuality": "highest",
         "preferredFormat": "mp3",
-        "filenameTemplateParts": None,
-        "s3AccessKeyId": None,
-        "s3SecretAccessKey": None,
-        "s3Bucket": None,
-        "s3Region": None,
-        "azureConnectionString": None,
-        "azureContainerName": None,
-        "googleCloudServiceKey": None,
-        "googleCloudBucketName": None,
-        "transcriptionAndSubtitle": None,
     }
     run = client.actor("streamers/youtube-video-downloader").call(run_input=run_input)
     dataset_id = getattr(run, "default_dataset_id", None) or run.get("defaultDatasetId") or run.get("default_dataset_id")

@@ -3,8 +3,10 @@ import io
 from fastapi.testclient import TestClient
 
 from app import (
+    analyze_text_content,
     app,
     download_audio,
+    extract_youtube_video_id,
     find_http_urls_in_payload,
     is_youtube_url,
     select_any_non_youtube_url,
@@ -72,6 +74,17 @@ def test_find_http_urls_in_payload_collects_nested_urls():
     assert 'https://example.com/b.mp4' in urls
 
 
+def test_extract_youtube_video_id_supports_multiple_formats():
+    assert extract_youtube_video_id('https://www.youtube.com/watch?v=abc123') == 'abc123'
+    assert extract_youtube_video_id('https://youtu.be/xyz789') == 'xyz789'
+    assert extract_youtube_video_id('https://www.youtube.com/shorts/short123') == 'short123'
+
+
+def test_analyze_text_content_uses_fallback_summary_when_empty():
+    result = analyze_text_content('', 'Summarize')
+    assert result['headline'] == 'Key takeaways for: Summarize'
+
+
 def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp_path):
     monkeypatch.setattr('app.APIFY_TOKEN', 'token')
     monkeypatch.setattr('app.download_audio_via_apify', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('apify failed')))
@@ -82,6 +95,24 @@ def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp
         assert 'Apify YouTube download failed' in str(exc)
     else:
         raise AssertionError('Expected RuntimeError')
+
+
+def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('download failed')))
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript from YouTube captions.')
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+
+    response = client.post(
+        '/api/analyze',
+        data={'url': 'https://www.youtube.com/watch?v=abc123', 'query': 'Summarize'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert 'headline' in payload['result']
+    assert payload['result']['topics'] == ['Topic A']
 
 
 def test_health_endpoint():

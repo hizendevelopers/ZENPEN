@@ -65,6 +65,7 @@ SENTENCE_TRANSFORMER_CLASS = None
 WHISPER_MODULE = None
 GENAI_MODULE = None
 APIFY_CLIENT_CLASS = None
+YOUTUBE_TRANSCRIPT_API_CLASS = None
 
 
 class QuietYtdlpLogger:
@@ -101,6 +102,7 @@ def dependency_status() -> dict[str, bool | str]:
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "gemini_api_key_configured": bool(GEMINI_API_KEY),
         "apify_configured": bool(APIFY_TOKEN),
+        "youtube_transcript_api": module_available("youtube_transcript_api"),
         "supabase_configured": supabase_is_configured(),
     }
 
@@ -187,6 +189,17 @@ def get_apify_client_class():
         except Exception as exc:
             raise RuntimeError(build_missing_dependency_message("apify-client")) from exc
     return APIFY_CLIENT_CLASS
+
+
+def get_youtube_transcript_api_class():
+    global YOUTUBE_TRANSCRIPT_API_CLASS
+    if YOUTUBE_TRANSCRIPT_API_CLASS is None:
+        try:
+            module = importlib.import_module("youtube_transcript_api")
+            YOUTUBE_TRANSCRIPT_API_CLASS = getattr(module, "YouTubeTranscriptApi")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("youtube-transcript-api")) from exc
+    return YOUTUBE_TRANSCRIPT_API_CLASS
 
 
 def supabase_is_configured() -> bool:
@@ -602,6 +615,47 @@ def maybe_write_youtube_cookies_file(output_dir: Path) -> Optional[Path]:
 def is_youtube_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return "youtube.com" in host or "youtu.be" in host
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if "youtu.be" in host:
+        candidate = parsed.path.strip("/").split("/")[0]
+        return candidate or None
+    if "youtube.com" in host:
+        if parsed.path == "/watch":
+            for pair in parsed.query.split("&"):
+                if pair.startswith("v="):
+                    return pair.split("=", 1)[1] or None
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 2 and path_parts[0] in {"shorts", "embed", "live"}:
+            return path_parts[1]
+    return None
+
+
+def fetch_youtube_transcript_text(url: str) -> str:
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        raise RuntimeError("Could not extract a valid YouTube video id from the URL.")
+
+    transcript_api = get_youtube_transcript_api_class()
+    try:
+        transcript_entries = transcript_api.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+    except Exception:
+        transcript_entries = transcript_api.get_transcript(video_id)
+
+    if not isinstance(transcript_entries, list):
+        raise RuntimeError("Transcript service returned an unexpected response.")
+
+    transcript_text = " ".join(
+        str(item.get("text", "")).replace("\n", " ").strip()
+        for item in transcript_entries
+        if isinstance(item, dict) and item.get("text")
+    ).strip()
+    if not transcript_text:
+        raise RuntimeError("No transcript text was available for this YouTube video.")
+    return transcript_text
 
 
 def select_apify_download_url(item: dict[str, object]) -> Optional[str]:
@@ -1188,6 +1242,24 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
         return fallback_summary(transcript, query)
 
 
+def analyze_text_content(transcript: str, query: str = "Summarize the content") -> dict[str, str]:
+    if not transcript.strip():
+        return fallback_summary("", query)
+
+    chunks = chunk_text(transcript)
+    try:
+        embeddings = get_embeddings(chunks)
+        index = build_faiss_index(embeddings)
+        context = retrieve_context(query, chunks, index)
+    except Exception:
+        context = " ".join(chunks[:3])
+
+    try:
+        return gemini_rag(context, query)
+    except Exception:
+        return fallback_summary(transcript, query)
+
+
 async def save_uploaded_file(upload: UploadFile, destination: Path) -> None:
     content = await upload.read()
     destination.write_bytes(content)
@@ -1260,6 +1332,7 @@ async def analyze_endpoint(
         with tempfile.TemporaryDirectory(prefix="media-analyzer-") as temp_dir:
             temp_dir_path = Path(temp_dir)
             temp_audio_path: Optional[str] = None
+            transcript_override: Optional[str] = None
 
             if file:
                 suffix = Path(file.filename or "upload.wav").suffix.lower() or ".wav"
@@ -1273,12 +1346,24 @@ async def analyze_endpoint(
                 else:
                     temp_audio_path = str(upload_path)
             elif url:
-                temp_audio_path = download_audio(url, temp_dir)
+                try:
+                    temp_audio_path = download_audio(url, temp_dir)
+                except Exception:
+                    if is_youtube_url(url):
+                        transcript_override = fetch_youtube_transcript_text(url)
+                    else:
+                        raise
 
-            result = analyze_media(
-                local_audio_path=temp_audio_path,
-                query=query or "Summarize the content",
-            )
+            if transcript_override is not None:
+                result = analyze_text_content(
+                    transcript_override,
+                    query=query or "Summarize the content",
+                )
+            else:
+                result = analyze_media(
+                    local_audio_path=temp_audio_path,
+                    query=query or "Summarize the content",
+                )
             topic_list = [topic.strip() for topic in (selected_topics or "").split(",") if topic.strip()]
             enriched_result = enrich_analysis(
                 result,

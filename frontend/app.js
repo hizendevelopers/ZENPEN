@@ -799,9 +799,16 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
     headers: buildAuthHeaders(),
     body: formData,
   });
-  const payload = await response.json();
+  const responseText = await response.text();
+  let payload = null;
+  try {
+    payload = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    payload = null;
+  }
   if (!response.ok || !payload.success) {
-    throw new Error(payload.error || payload.detail || 'Request failed.');
+    const message = payload?.error || payload?.detail || responseText || 'Request failed.';
+    throw new Error(message);
   }
   return payload.result;
 }

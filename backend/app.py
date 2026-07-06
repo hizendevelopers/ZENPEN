@@ -650,6 +650,15 @@ def select_any_non_youtube_url(payload: object) -> Optional[str]:
     return None
 
 
+def parse_json_response_or_raise(response: httpx.Response, context: str) -> object:
+    try:
+        return response.json()
+    except ValueError as exc:
+        text = response.text.strip()
+        preview = text[:300] if text else "empty response"
+        raise RuntimeError(f"{context} returned a non-JSON response: {preview}") from exc
+
+
 def infer_download_suffix(download_url: str, fallback: str = ".mp3") -> str:
     path = urlparse(download_url).path
     suffix = Path(path).suffix.lower()
@@ -676,7 +685,7 @@ def select_apify_kv_media_url(store_id: str) -> Optional[str]:
         timeout=30.0,
     )
     response.raise_for_status()
-    payload = response.json()
+    payload = parse_json_response_or_raise(response, "Apify key-value store listing")
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
         return None

@@ -2,7 +2,7 @@ import io
 
 from fastapi.testclient import TestClient
 
-from app import app, select_best_audio_format_id
+from app import app, is_youtube_url, select_apify_download_url, select_best_audio_format_id
 
 client = TestClient(app)
 
@@ -26,6 +26,20 @@ def test_select_best_audio_format_falls_back_to_muxed():
         ]
     }
     assert select_best_audio_format_id(info) == '22'
+
+
+def test_select_apify_download_url_prefers_download_fields():
+    item = {
+        'url': 'https://www.youtube.com/watch?v=abc123',
+        'downloadUrl': 'https://api.apify.com/v2/key-value-stores/example/records/video.mp3',
+    }
+    assert select_apify_download_url(item) == 'https://api.apify.com/v2/key-value-stores/example/records/video.mp3'
+
+
+def test_is_youtube_url_detects_supported_hosts():
+    assert is_youtube_url('https://www.youtube.com/watch?v=abc123') is True
+    assert is_youtube_url('https://youtu.be/abc123') is True
+    assert is_youtube_url('https://example.com/file.mp3') is False
 
 
 def test_health_endpoint():

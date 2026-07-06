@@ -17,6 +17,7 @@ Notes:
 - The backend loads `GEMINI_API_KEY` from a root `.env` file or your shell environment, and falls back to a local summary if it is unavailable.
 - To use Gemini locally, create a `.env` file in the project root based on `.env.example`.
 - To connect Supabase properly, add `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_SECRET_KEY` to `.env`, then run the SQL in [supabase/schema.sql](./supabase/schema.sql) inside the Supabase SQL editor.
+- If `APIFY_TOKEN` is configured, the backend will try Apify's `streamers/youtube-video-downloader` actor first for YouTube URLs, then fall back to local `yt-dlp`.
 - When Supabase is configured, login/sign-up use Supabase Auth and analysis history is stored in the `analysis_jobs`, `analysis_topics`, and `generated_articles` tables.
 - If you want the safest startup path on Windows, run `.\run.ps1` from the project root. It uses the project virtual environment automatically.
 
@@ -44,6 +45,7 @@ For a complete working deployment, use a container-friendly platform such as Ren
    - `SUPABASE_PUBLISHABLE_KEY`
    - `SUPABASE_SECRET_KEY`
    - `SUPABASE_JWKS_URL`
+   - `APIFY_TOKEN` (recommended for more reliable YouTube downloads)
    - `YOUTUBE_COOKIES_B64` (optional, but recommended if YouTube asks for sign-in)
 5. Deploy.
 

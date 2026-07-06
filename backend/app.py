@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import nltk
 import numpy as np
@@ -52,6 +53,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -62,6 +64,7 @@ VIDEO_FILE_CLIP_CLASS = None
 SENTENCE_TRANSFORMER_CLASS = None
 WHISPER_MODULE = None
 GENAI_MODULE = None
+APIFY_CLIENT_CLASS = None
 
 
 class QuietYtdlpLogger:
@@ -97,6 +100,7 @@ def dependency_status() -> dict[str, bool | str]:
         "gemini": module_available("google.genai"),
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "gemini_api_key_configured": bool(GEMINI_API_KEY),
+        "apify_configured": bool(APIFY_TOKEN),
         "supabase_configured": supabase_is_configured(),
     }
 
@@ -172,6 +176,17 @@ def get_faiss_module():
         except Exception as exc:
             raise RuntimeError(build_missing_dependency_message("faiss-cpu")) from exc
     return FAISS_MODULE
+
+
+def get_apify_client_class():
+    global APIFY_CLIENT_CLASS
+    if APIFY_CLIENT_CLASS is None:
+        try:
+            module = importlib.import_module("apify_client")
+            APIFY_CLIENT_CLASS = getattr(module, "ApifyClient")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("apify-client")) from exc
+    return APIFY_CLIENT_CLASS
 
 
 def supabase_is_configured() -> bool:
@@ -584,6 +599,101 @@ def maybe_write_youtube_cookies_file(output_dir: Path) -> Optional[Path]:
     return cookies_path
 
 
+def is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return "youtube.com" in host or "youtu.be" in host
+
+
+def select_apify_download_url(item: dict[str, object]) -> Optional[str]:
+    candidate_keys = (
+        "downloadUrl",
+        "download_url",
+        "apify_storage_url",
+        "storageUrl",
+        "fileUrl",
+        "file_url",
+        "url",
+    )
+    for key in candidate_keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            if key == "url" and is_youtube_url(value):
+                continue
+            return value
+    return None
+
+
+def infer_download_suffix(download_url: str, fallback: str = ".mp3") -> str:
+    path = urlparse(download_url).path
+    suffix = Path(path).suffix.lower()
+    return suffix if suffix else fallback
+
+
+def download_file_to_path(download_url: str, destination: Path) -> Path:
+    with httpx.stream("GET", download_url, follow_redirects=True, timeout=120.0) as response:
+        response.raise_for_status()
+        with destination.open("wb") as file_handle:
+            for chunk in response.iter_bytes():
+                file_handle.write(chunk)
+    return destination
+
+
+def download_audio_via_apify(url: str, output_dir: str) -> str:
+    if not APIFY_TOKEN:
+        raise RuntimeError("Apify token is not configured")
+
+    apify_client_class = get_apify_client_class()
+    client = apify_client_class(APIFY_TOKEN)
+    run_input = {
+        "videos": [{"url": url}],
+        "storeInKVStore": None,
+        "preferredQuality": None,
+        "preferredFormat": "mp3",
+        "filenameTemplateParts": None,
+        "s3AccessKeyId": None,
+        "s3SecretAccessKey": None,
+        "s3Bucket": None,
+        "s3Region": None,
+        "azureConnectionString": None,
+        "azureContainerName": None,
+        "googleCloudServiceKey": None,
+        "googleCloudBucketName": None,
+        "transcriptionAndSubtitle": None,
+    }
+    run = client.actor("streamers/youtube-video-downloader").call(run_input=run_input)
+    dataset_id = getattr(run, "default_dataset_id", None) or run.get("defaultDatasetId") or run.get("default_dataset_id")
+    if not dataset_id:
+        raise RuntimeError("Apify actor finished without a dataset id.")
+
+    items = list(client.dataset(dataset_id).iterate_items())
+    if not items:
+        raise RuntimeError("Apify actor did not return any downloadable items.")
+
+    first_item = items[0]
+    if not isinstance(first_item, dict):
+        raise RuntimeError("Apify actor returned an invalid item payload.")
+
+    status = str(first_item.get("status") or "").lower()
+    if "fail" in status or "error" in status:
+        raise RuntimeError(str(first_item.get("error") or first_item.get("message") or "Apify download failed."))
+
+    download_url = select_apify_download_url(first_item)
+    if not download_url:
+        raise RuntimeError("Apify actor completed, but no downloadable file URL was returned.")
+
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    suffix = infer_download_suffix(download_url, fallback=".mp3")
+    downloaded_path = output_dir_path / f"apify-download{suffix}"
+    download_file_to_path(download_url, downloaded_path)
+
+    if suffix in {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".opus", ".webm"}:
+        return str(downloaded_path)
+
+    extracted_audio_path = output_dir_path / "apify-extracted-audio.wav"
+    return extract_audio_from_video(str(downloaded_path), str(extracted_audio_path))
+
+
 def normalize_yt_info_entry(info: dict[str, object]) -> dict[str, object]:
     entries = info.get("entries")
     if isinstance(entries, list):
@@ -631,6 +741,13 @@ def select_best_audio_format_id(info: dict[str, object]) -> Optional[str]:
 
 
 def download_audio(url: str, output_dir: str) -> str:
+    apify_error: Optional[Exception] = None
+    if APIFY_TOKEN and is_youtube_url(url):
+        try:
+            return download_audio_via_apify(url, output_dir)
+        except Exception as exc:
+            apify_error = exc
+
     yt_dlp = get_yt_dlp_module()
     ensure_ffmpeg()
 
@@ -703,6 +820,11 @@ def download_audio(url: str, output_dir: str) -> str:
             raise RuntimeError(
                 "YouTube blocked this server request. The app has been updated with stronger download support; please retry once. "
                 "If the video still fails, upload the media file directly."
+            ) from exc
+        if apify_error is not None:
+            raise RuntimeError(
+                f"Could not download audio from that YouTube URL. Apify fallback failed with: {apify_error}. "
+                f"yt-dlp details: {error_text}"
             ) from exc
         raise RuntimeError(
             f"Could not download audio from that YouTube URL. Details: {error_text}"

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "functions": {
+    "backend/app.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{.git/**,.venv/**,.pytest_cache/**,__pycache__/**,**/*.pyc,**/test_*.py,backend/test_app.py,supabase/**,run.ps1,Dockerfile}"
+    }
+  }
+}

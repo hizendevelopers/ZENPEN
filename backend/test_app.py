@@ -70,6 +70,12 @@ def test_history_endpoint():
     assert isinstance(response.json(), list)
 
 
+def test_frontend_deep_links_fallback_to_index():
+    response = client.get('/products/article-generator')
+    assert response.status_code == 200
+    assert 'text/html' in response.headers['content-type']
+
+
 def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))

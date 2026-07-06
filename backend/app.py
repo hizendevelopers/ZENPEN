@@ -950,3 +950,10 @@ async def analyze_endpoint(
             return JSONResponse({"success": True, "result": enriched_result})
     except Exception as exc:
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/{full_path:path}")
+def frontend_routes(full_path: str) -> FileResponse:
+    if full_path.startswith(("api/", "static/")):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(FRONTEND_DIR / "index.html")

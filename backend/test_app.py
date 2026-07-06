@@ -2,7 +2,15 @@ import io
 
 from fastapi.testclient import TestClient
 
-from app import app, download_audio, is_youtube_url, select_apify_download_url, select_best_audio_format_id
+from app import (
+    app,
+    download_audio,
+    find_http_urls_in_payload,
+    is_youtube_url,
+    select_any_non_youtube_url,
+    select_apify_download_url,
+    select_best_audio_format_id,
+)
 
 client = TestClient(app)
 
@@ -40,6 +48,28 @@ def test_is_youtube_url_detects_supported_hosts():
     assert is_youtube_url('https://www.youtube.com/watch?v=abc123') is True
     assert is_youtube_url('https://youtu.be/abc123') is True
     assert is_youtube_url('https://example.com/file.mp3') is False
+
+
+def test_select_any_non_youtube_url_finds_nested_media_link():
+    payload = {
+        'url': 'https://www.youtube.com/watch?v=abc123',
+        'nested': {
+            'download': {
+                'href': 'https://cdn.example.com/audio/file.mp3',
+            }
+        },
+    }
+    assert select_any_non_youtube_url(payload) == 'https://cdn.example.com/audio/file.mp3'
+
+
+def test_find_http_urls_in_payload_collects_nested_urls():
+    payload = {
+        'a': 'https://example.com/a.mp3',
+        'b': [{'c': 'https://example.com/b.mp4'}],
+    }
+    urls = find_http_urls_in_payload(payload)
+    assert 'https://example.com/a.mp3' in urls
+    assert 'https://example.com/b.mp4' in urls
 
 
 def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp_path):

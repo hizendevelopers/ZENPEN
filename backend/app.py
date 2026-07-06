@@ -623,6 +623,33 @@ def select_apify_download_url(item: dict[str, object]) -> Optional[str]:
     return None
 
 
+def find_http_urls_in_payload(payload: object) -> list[str]:
+    urls: list[str] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, str):
+            if value.startswith(("http://", "https://")):
+                urls.append(value)
+            return
+        if isinstance(value, dict):
+            for nested_value in value.values():
+                walk(nested_value)
+            return
+        if isinstance(value, list):
+            for nested_value in value:
+                walk(nested_value)
+
+    walk(payload)
+    return urls
+
+
+def select_any_non_youtube_url(payload: object) -> Optional[str]:
+    for value in find_http_urls_in_payload(payload):
+        if not is_youtube_url(value):
+            return value
+    return None
+
+
 def infer_download_suffix(download_url: str, fallback: str = ".mp3") -> str:
     path = urlparse(download_url).path
     suffix = Path(path).suffix.lower()
@@ -636,6 +663,39 @@ def download_file_to_path(download_url: str, destination: Path) -> Path:
             for chunk in response.iter_bytes():
                 file_handle.write(chunk)
     return destination
+
+
+def apify_kv_record_url(store_id: str, record_key: str) -> str:
+    return f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{record_key}?disableRedirect=true&token={APIFY_TOKEN}"
+
+
+def select_apify_kv_media_url(store_id: str) -> Optional[str]:
+    response = httpx.get(
+        f"https://api.apify.com/v2/key-value-stores/{store_id}/keys",
+        params={"token": APIFY_TOKEN},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+
+    def is_media_item(item: dict[str, object]) -> bool:
+        key = str(item.get("key") or "").lower()
+        content_type = str(item.get("contentType") or "").lower()
+        return (
+            content_type.startswith("audio/")
+            or content_type.startswith("video/")
+            or key.endswith((".mp3", ".mp4", ".m4a", ".wav", ".webm", ".aac", ".ogg", ".opus"))
+        )
+
+    for item in items:
+        if isinstance(item, dict) and is_media_item(item):
+            key = item.get("key")
+            if isinstance(key, str) and key:
+                return apify_kv_record_url(store_id, key)
+    return None
 
 
 def download_audio_via_apify(url: str, output_dir: str) -> str:
@@ -652,6 +712,11 @@ def download_audio_via_apify(url: str, output_dir: str) -> str:
     }
     run = client.actor("streamers/youtube-video-downloader").call(run_input=run_input)
     dataset_id = getattr(run, "default_dataset_id", None) or run.get("defaultDatasetId") or run.get("default_dataset_id")
+    key_value_store_id = (
+        getattr(run, "default_key_value_store_id", None)
+        or run.get("defaultKeyValueStoreId")
+        or run.get("default_key_value_store_id")
+    )
     if not dataset_id:
         raise RuntimeError("Apify actor finished without a dataset id.")
 
@@ -669,7 +734,11 @@ def download_audio_via_apify(url: str, output_dir: str) -> str:
 
     download_url = select_apify_download_url(first_item)
     if not download_url:
-        raise RuntimeError("Apify actor completed, but no downloadable file URL was returned.")
+        download_url = select_any_non_youtube_url(first_item)
+    if not download_url and key_value_store_id:
+        download_url = select_apify_kv_media_url(str(key_value_store_id))
+    if not download_url:
+        raise RuntimeError("Apify actor completed, but no downloadable file URL was returned from the dataset or key-value store.")
 
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)

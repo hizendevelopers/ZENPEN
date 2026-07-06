@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -12,11 +14,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-try:
-    import faiss
-except Exception:  # pragma: no cover - optional dependency
-    faiss = None
-
 import nltk
 import numpy as np
 import httpx
@@ -27,35 +24,6 @@ from pydantic import BaseModel
 from starlette.staticfiles import StaticFiles
 from nltk.tokenize import sent_tokenize
 from dotenv import load_dotenv
-
-try:
-    import yt_dlp
-except Exception:  # pragma: no cover - optional dependency
-    yt_dlp = None
-
-try:
-    from moviepy.editor import VideoFileClip
-except Exception:  # pragma: no cover - optional dependency
-    try:
-        # moviepy 2.x exposes VideoFileClip at the top level.
-        from moviepy import VideoFileClip
-    except Exception:  # pragma: no cover - optional dependency
-        VideoFileClip = None
-
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:  # pragma: no cover - optional dependency
-    SentenceTransformer = None
-
-try:
-    import whisper
-except Exception:  # pragma: no cover - optional dependency
-    whisper = None
-
-try:
-    from google import genai
-except Exception:  # pragma: no cover - optional dependency
-    genai = None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -86,6 +54,12 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 WHISPER_MODEL = None
 EMBEDDER = None
 GENAI_CLIENT = None
+FAISS_MODULE = None
+YT_DLP_MODULE = None
+VIDEO_FILE_CLIP_CLASS = None
+SENTENCE_TRANSFORMER_CLASS = None
+WHISPER_MODULE = None
+GENAI_MODULE = None
 
 
 class QuietYtdlpLogger:
@@ -113,16 +87,89 @@ class LoginRequest(BaseModel):
 def dependency_status() -> dict[str, bool | str]:
     return {
         "python": sys.executable,
-        "yt_dlp": yt_dlp is not None,
-        "whisper": whisper is not None,
-        "moviepy": VideoFileClip is not None,
-        "faiss": faiss is not None,
-        "sentence_transformers": SentenceTransformer is not None,
-        "gemini": genai is not None,
+        "yt_dlp": module_available("yt_dlp"),
+        "whisper": module_available("whisper"),
+        "moviepy": module_available("moviepy"),
+        "faiss": module_available("faiss"),
+        "sentence_transformers": module_available("sentence_transformers"),
+        "gemini": module_available("google.genai"),
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "gemini_api_key_configured": bool(GEMINI_API_KEY),
         "supabase_configured": supabase_is_configured(),
     }
+
+
+def module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def get_genai_module():
+    global GENAI_MODULE
+    if GENAI_MODULE is None:
+        try:
+            GENAI_MODULE = importlib.import_module("google.genai")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("google-genai")) from exc
+    return GENAI_MODULE
+
+
+def get_whisper_module():
+    global WHISPER_MODULE
+    if WHISPER_MODULE is None:
+        try:
+            WHISPER_MODULE = importlib.import_module("whisper")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("Whisper")) from exc
+    return WHISPER_MODULE
+
+
+def get_sentence_transformer_class():
+    global SENTENCE_TRANSFORMER_CLASS
+    if SENTENCE_TRANSFORMER_CLASS is None:
+        try:
+            module = importlib.import_module("sentence_transformers")
+            SENTENCE_TRANSFORMER_CLASS = getattr(module, "SentenceTransformer")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("sentence-transformers")) from exc
+    return SENTENCE_TRANSFORMER_CLASS
+
+
+def get_yt_dlp_module():
+    global YT_DLP_MODULE
+    if YT_DLP_MODULE is None:
+        try:
+            YT_DLP_MODULE = importlib.import_module("yt_dlp")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("yt-dlp")) from exc
+    return YT_DLP_MODULE
+
+
+def get_video_file_clip_class():
+    global VIDEO_FILE_CLIP_CLASS
+    if VIDEO_FILE_CLIP_CLASS is None:
+        try:
+            module = importlib.import_module("moviepy.editor")
+            VIDEO_FILE_CLIP_CLASS = getattr(module, "VideoFileClip")
+        except Exception:
+            try:
+                module = importlib.import_module("moviepy")
+                VIDEO_FILE_CLIP_CLASS = getattr(module, "VideoFileClip")
+            except Exception as exc:
+                raise RuntimeError(build_missing_dependency_message("moviepy")) from exc
+    return VIDEO_FILE_CLIP_CLASS
+
+
+def get_faiss_module():
+    global FAISS_MODULE
+    if FAISS_MODULE is None:
+        try:
+            FAISS_MODULE = importlib.import_module("faiss")
+        except Exception as exc:
+            raise RuntimeError(build_missing_dependency_message("faiss-cpu")) from exc
+    return FAISS_MODULE
 
 
 def supabase_is_configured() -> bool:
@@ -463,11 +510,10 @@ def ensure_ffmpeg() -> None:
 
 def get_genai_client():
     global GENAI_CLIENT
-    if genai is None:
-        raise RuntimeError(build_missing_dependency_message("google-genai"))
     if not GEMINI_API_KEY:
         raise RuntimeError("Gemini is not configured")
     if GENAI_CLIENT is None:
+        genai = get_genai_module()
         GENAI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
     return GENAI_CLIENT
 
@@ -508,9 +554,8 @@ def add_history_entry(result: dict[str, str], source: str) -> None:
 
 def get_whisper_model():
     global WHISPER_MODEL
-    if whisper is None:
-        raise RuntimeError(build_missing_dependency_message("Whisper"))
     if WHISPER_MODEL is None:
+        whisper = get_whisper_module()
         WHISPER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         WHISPER_MODEL = whisper.load_model("tiny", download_root=str(WHISPER_CACHE_DIR))
     return WHISPER_MODEL
@@ -518,16 +563,14 @@ def get_whisper_model():
 
 def get_embedder():
     global EMBEDDER
-    if SentenceTransformer is None:
-        raise RuntimeError(build_missing_dependency_message("sentence-transformers"))
     if EMBEDDER is None:
-        EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
+        sentence_transformer = get_sentence_transformer_class()
+        EMBEDDER = sentence_transformer("all-MiniLM-L6-v2")
     return EMBEDDER
 
 
 def download_audio(url: str, output_dir: str) -> str:
-    if yt_dlp is None:
-        raise RuntimeError(build_missing_dependency_message("yt-dlp"))
+    yt_dlp = get_yt_dlp_module()
     ensure_ffmpeg()
 
     output_dir_path = Path(output_dir)
@@ -563,11 +606,10 @@ def download_audio(url: str, output_dir: str) -> str:
 
 
 def extract_audio_from_video(video_path: str, output_audio_path: str) -> str:
-    if VideoFileClip is None:
-        raise RuntimeError(build_missing_dependency_message("moviepy"))
+    video_file_clip = get_video_file_clip_class()
     ensure_ffmpeg()
 
-    with VideoFileClip(video_path) as clip:
+    with video_file_clip(video_path) as clip:
         if clip.audio is None:
             raise RuntimeError("The uploaded video does not contain an audio track.")
         clip.audio.write_audiofile(output_audio_path, logger=None)
@@ -605,8 +647,7 @@ def get_embeddings(chunks: list[str]) -> np.ndarray:
 
 
 def build_faiss_index(embeddings: np.ndarray):
-    if faiss is None:
-        raise RuntimeError(build_missing_dependency_message("faiss-cpu"))
+    faiss = get_faiss_module()
     dim = len(embeddings[0])
     index = faiss.IndexFlatL2(dim)
     index.add(np.array(embeddings).astype("float32"))

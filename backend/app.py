@@ -647,7 +647,7 @@ def download_audio_via_apify(url: str, output_dir: str) -> str:
     run_input = {
         "videos": [{"url": url}],
         "storeInKVStore": False,
-        "preferredQuality": "highest",
+        "preferredQuality": "144p",
         "preferredFormat": "mp3",
     }
     run = client.actor("streamers/youtube-video-downloader").call(run_input=run_input)

@@ -22,7 +22,7 @@ import numpy as np
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.staticfiles import StaticFiles
 from nltk.tokenize import sent_tokenize
@@ -75,10 +75,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -486,8 +484,13 @@ def load_history() -> list[dict]:
 
 
 def save_history(items: list[dict]) -> None:
-    with HISTORY_FILE.open("w", encoding="utf-8") as handle:
-        json.dump(items, handle, indent=2)
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with HISTORY_FILE.open("w", encoding="utf-8") as handle:
+            json.dump(items, handle, indent=2)
+    except OSError:
+        # Read-only filesystems such as serverless runtimes should not crash the app.
+        return None
 
 
 def add_history_entry(result: dict[str, str], source: str) -> None:
@@ -578,7 +581,11 @@ def transcribe_audio(audio_path: str) -> str:
 
 
 def chunk_text(text: str, max_chars: int = 600) -> list[str]:
-    sentences = sent_tokenize(text)
+    try:
+        sentences = sent_tokenize(text)
+    except LookupError:
+        # Fall back when punkt data is unavailable in serverless environments.
+        sentences = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", text) if segment.strip()]
     chunks, current = [], ""
     for sentence in sentences:
         if len(current) + len(sentence) <= max_chars:
@@ -840,8 +847,11 @@ async def save_uploaded_file(upload: UploadFile, destination: Path) -> None:
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "index.html")
+def index():
+    index_file = FRONTEND_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return HTMLResponse("<h1>ZENPEN is running</h1><p>Frontend assets are not available in this deployment bundle.</p>")
 
 
 @app.get("/api/health")
@@ -953,7 +963,10 @@ async def analyze_endpoint(
 
 
 @app.get("/{full_path:path}")
-def frontend_routes(full_path: str) -> FileResponse:
+def frontend_routes(full_path: str):
     if full_path.startswith(("api/", "static/")):
         raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(FRONTEND_DIR / "index.html")
+    index_file = FRONTEND_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return HTMLResponse("<h1>ZENPEN is running</h1><p>Frontend assets are not available in this deployment bundle.</p>")

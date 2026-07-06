@@ -582,7 +582,25 @@ def download_audio(url: str, output_dir: str) -> str:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 3,
+        "extractor_retries": 3,
+        "geo_bypass": True,
         "logger": QuietYtdlpLogger(),
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/127.0.0.0 Safari/537.36"
+            )
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_embedded", "web_creator", "web"]
+            }
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -595,8 +613,20 @@ def download_audio(url: str, output_dir: str) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except yt_dlp.utils.DownloadError as exc:
+        error_text = str(exc)
+        if "Video unavailable" in error_text:
+            raise RuntimeError("This YouTube video is unavailable or private.") from exc
+        if "Sign in to confirm your age" in error_text:
+            raise RuntimeError("This YouTube video is age-restricted and cannot be downloaded without cookies.") from exc
+        if "HTTP Error 429" in error_text:
+            raise RuntimeError("YouTube is rate-limiting the server right now. Please retry in a moment or upload the file directly.") from exc
+        if "HTTP Error 403" in error_text or "PO Token" in error_text or "challenge" in error_text:
+            raise RuntimeError(
+                "YouTube blocked this server request. The app has been updated with stronger download support; please retry once. "
+                "If the video still fails, upload the media file directly."
+            ) from exc
         raise RuntimeError(
-            "Could not download audio from that YouTube URL. Please try another video or upload the media file directly."
+            f"Could not download audio from that YouTube URL. Details: {error_text}"
         ) from exc
 
     wav_files = sorted(output_dir_path.glob("downloaded*.wav"))

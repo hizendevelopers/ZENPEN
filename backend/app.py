@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib
 import importlib.util
 import json
@@ -50,6 +51,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
+YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -569,12 +571,26 @@ def get_embedder():
     return EMBEDDER
 
 
+def maybe_write_youtube_cookies_file(output_dir: Path) -> Optional[Path]:
+    if not YOUTUBE_COOKIES_B64:
+        return None
+    try:
+        decoded = base64.b64decode(YOUTUBE_COOKIES_B64).decode("utf-8")
+    except Exception as exc:
+        raise RuntimeError("YOUTUBE_COOKIES_B64 is not valid base64-encoded Netscape cookie data.") from exc
+
+    cookies_path = output_dir / "youtube-cookies.txt"
+    cookies_path.write_text(decoded, encoding="utf-8")
+    return cookies_path
+
+
 def download_audio(url: str, output_dir: str) -> str:
     yt_dlp = get_yt_dlp_module()
     ensure_ffmpeg()
 
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
+    cookies_file = maybe_write_youtube_cookies_file(output_dir_path)
     output_template = str(output_dir_path / "downloaded.%(ext)s")
     ydl_opts = {
         "format": "bestaudio/best",
@@ -609,6 +625,8 @@ def download_audio(url: str, output_dir: str) -> str:
             }
         ],
     }
+    if cookies_file:
+        ydl_opts["cookiefile"] = str(cookies_file)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -618,6 +636,11 @@ def download_audio(url: str, output_dir: str) -> str:
             raise RuntimeError("This YouTube video is unavailable or private.") from exc
         if "Sign in to confirm your age" in error_text:
             raise RuntimeError("This YouTube video is age-restricted and cannot be downloaded without cookies.") from exc
+        if "Please sign in" in error_text or "cookies" in error_text.lower():
+            raise RuntimeError(
+                "This YouTube video requires authenticated cookies. Add a Railway env var named "
+                "YOUTUBE_COOKIES_B64 containing base64-encoded Netscape YouTube cookies, then redeploy."
+            ) from exc
         if "HTTP Error 429" in error_text:
             raise RuntimeError("YouTube is rate-limiting the server right now. Please retry in a moment or upload the file directly.") from exc
         if "HTTP Error 403" in error_text or "PO Token" in error_text or "challenge" in error_text:

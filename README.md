@@ -13,6 +13,7 @@ Then open http://127.0.0.1:8000/
 
 Notes:
 - `ffmpeg` must be available on your `PATH` for YouTube audio downloads and video-to-audio extraction.
+- Some YouTube videos now require authenticated cookies. For cloud deployments, add `YOUTUBE_COOKIES_B64` as a base64-encoded Netscape cookies file exported from a browser session that can access the target YouTube videos.
 - The backend loads `GEMINI_API_KEY` from a root `.env` file or your shell environment, and falls back to a local summary if it is unavailable.
 - To use Gemini locally, create a `.env` file in the project root based on `.env.example`.
 - To connect Supabase properly, add `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_SECRET_KEY` to `.env`, then run the SQL in [supabase/schema.sql](./supabase/schema.sql) inside the Supabase SQL editor.
@@ -43,6 +44,7 @@ For a complete working deployment, use a container-friendly platform such as Ren
    - `SUPABASE_PUBLISHABLE_KEY`
    - `SUPABASE_SECRET_KEY`
    - `SUPABASE_JWKS_URL`
+   - `YOUTUBE_COOKIES_B64` (optional, but recommended if YouTube asks for sign-in)
 5. Deploy.
 
 The Docker image installs `ffmpeg` and `libgomp1`, uses Python 3.11, and runs the full FastAPI app so the frontend and backend stay on the same origin.

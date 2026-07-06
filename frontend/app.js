@@ -1,7 +1,7 @@
 const root = document.getElementById('app');
 
-const USERS_KEY = 'media-suite-users';
-const SESSION_KEY = 'media-suite-session';
+const LOCAL_USERS_KEY = 'media-suite-users';
+const LOCAL_SESSION_KEY = 'media-suite-session';
 
 const PRODUCTS = [
   {
@@ -31,6 +31,10 @@ const PRODUCTS = [
 ];
 
 const appState = {
+  initialized: false,
+  config: null,
+  supabase: null,
+  session: null,
   authError: '',
   authMode: 'login',
   analysisResult: null,
@@ -58,30 +62,56 @@ function escapeHtml(value) {
 
 function getUsers() {
   try {
-    return JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
+    return JSON.parse(localStorage.getItem(LOCAL_USERS_KEY) || '[]');
   } catch {
     return [];
   }
 }
 
 function saveUsers(users) {
-  localStorage.setItem(USERS_KEY, JSON.stringify(users));
+  localStorage.setItem(LOCAL_USERS_KEY, JSON.stringify(users));
 }
 
-function getSession() {
+function getLocalSession() {
   try {
-    return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    return JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
   } catch {
     return null;
   }
 }
 
+function setLocalSession(session) {
+  localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(session));
+}
+
+function clearLocalSession() {
+  localStorage.removeItem(LOCAL_SESSION_KEY);
+}
+
+function hasSupabaseAuth() {
+  return Boolean(appState.config?.supabase?.enabled);
+}
+
+function getSession() {
+  return appState.session || getLocalSession();
+}
+
 function setSession(session) {
-  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  appState.session = session;
+  setLocalSession(session);
 }
 
 function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
+  appState.session = null;
+  clearLocalSession();
+}
+
+function getUserDisplayName(session = getSession()) {
+  if (!session) return '';
+  if (hasSupabaseAuth()) {
+    return session.user?.user_metadata?.full_name || session.user?.email || 'User';
+  }
+  return session.name || session.email || 'User';
 }
 
 function currentRoute() {
@@ -95,6 +125,22 @@ function navigate(path) {
 
 function isAuthenticated() {
   return Boolean(getSession());
+}
+
+async function initializeApp() {
+  try {
+    const response = await fetch('/api/config');
+    if (response.ok) {
+      appState.config = await response.json();
+    }
+  } catch {
+    appState.config = null;
+  }
+
+  appState.session = getLocalSession();
+
+  appState.initialized = true;
+  renderApp();
 }
 
 function productBySlug(slug) {
@@ -124,7 +170,7 @@ function buildHeader() {
   const authActions = session
     ? `
       <div class="header-auth">
-        <span class="user-chip">${escapeHtml(session.name || session.email)}</span>
+        <span class="user-chip">${escapeHtml(getUserDisplayName(session))}</span>
         <button class="ghost-btn" data-action="logout">Logout</button>
       </div>
     `
@@ -138,8 +184,7 @@ function buildHeader() {
   return `
     <header class="site-header">
       <a class="brand-mark" href="#/${session ? 'dashboard' : ''}">
-        <span class="brand-kicker">Media Suite</span>
-        <strong>Content Intelligence Platform</strong>
+        <img class="brand-logo-image" src="/static/assets/zenpen-logo.png" alt="ZenPen logo" />
       </a>
       <nav class="top-nav">
         <details class="nav-dropdown">
@@ -164,59 +209,174 @@ function buildHeader() {
 
 function buildLandingPage() {
   return `
-    <section class="landing-hero">
-      <div class="hero-copy">
-        <span class="eyebrow">Before Login Experience</span>
-        <h1>Analyze media, detect topics, and generate publication-ready content in one workspace.</h1>
+    <section class="landing-hero premium-hero hero-surface">
+      <img class="hero-background-image" src="/static/assets/hero-ai-dashboard.png" alt="AI dashboard and robot assistant interface" />
+      <div class="hero-surface-overlay"></div>
+      <div class="hero-copy hero-overlay-card">
+        <span class="eyebrow">AI-Powered Content Workflow</span>
+        <h1>
+          Create Articles,
+          <br />
+          Blogs & Subtitles
+          <br />
+          from Any Video
+          <br />
+          or URL
+        </h1>
         <p>
-          Start with URL or video analysis, move into topic selection, and finish with structured articles and subtitle-ready workflows.
+          ZENPEN helps your team analyze media, uncover key topics, and create
+          publication-ready content with a clean, guided AI workflow built for
+          speed, clarity, and creative momentum.
         </p>
+        <div class="hero-badges">
+          <span>Fast content analysis</span>
+          <span>Premium AI workflows</span>
+          <span>Built for modern publishing teams</span>
+        </div>
         <div class="hero-actions">
           <a class="primary-btn" href="#/signup">Get Started</a>
-          <a class="ghost-btn" href="#/login">Login</a>
+          <a class="ghost-btn" href="#/products/article-generator">Explore Products</a>
+        </div>
+        <div class="hero-trust-strip">
+          <div>
+            <strong>3 Products</strong>
+            <span>ready for your content pipeline</span>
+          </div>
+          <div>
+            <strong>AI-First</strong>
+            <span>designed for content operations</span>
+          </div>
         </div>
       </div>
-      <div class="hero-panel">
-        <div class="mini-stat">
-          <strong>3</strong>
-          <span>Products available</span>
-        </div>
-        <div class="mini-stat">
-          <strong>2-Step</strong>
-          <span>Analyze then generate</span>
-        </div>
-        <div class="mini-stat">
-          <strong>Responsive</strong>
-          <span>Desktop and mobile ready</span>
-        </div>
+      <div class="floating-tool-card hero-floating-note">
+        <span class="eyebrow">Workflow Stack</span>
+        <strong>Analyze. Select. Generate.</strong>
+        <p>Move from raw media to structured output in a single polished workspace.</p>
       </div>
     </section>
 
-    <section class="section-block">
+    <section class="section-block homepage-section">
       <div class="section-heading">
-        <span class="eyebrow">Products</span>
-        <h2>Explore the product suite</h2>
-        <p>Use the dropdown in the header or jump into a product after login.</p>
+        <span class="eyebrow">Our Products</span>
+        <h2>Purpose-built AI tools for modern creators</h2>
+        <p>Explore focused products designed to turn source media into usable editorial assets without friction.</p>
       </div>
       <div class="product-grid">
         ${PRODUCTS.map((product) => buildProductCard(product, !isAuthenticated())).join('')}
       </div>
     </section>
 
-    <section class="info-grid">
-      <article class="info-card">
-        <h3>About Us</h3>
-        <p>We build media intelligence tools that turn raw video and audio into usable publishing assets.</p>
+    <section class="feature-rail">
+      <article class="feature-rail-card">
+        <span class="feature-rail-icon icon-time"></span>
+        <div>
+          <h3>Save Time</h3>
+          <p>Automate repetitive content work and move faster.</p>
+        </div>
       </article>
-      <article class="info-card">
-        <h3>Blogs</h3>
-        <p>Read product thinking, workflow ideas, and editorial automation insights from the team.</p>
+      <article class="feature-rail-card">
+        <span class="feature-rail-icon icon-ai"></span>
+        <div>
+          <h3>Enhance Creativity</h3>
+          <p>Get AI suggestions that unlock more content ideas.</p>
+        </div>
       </article>
-      <article class="info-card">
-        <h3>Contact Us</h3>
-        <p>Need implementation help, integration support, or feature planning? Reach out from the contact page.</p>
+      <article class="feature-rail-card">
+        <span class="feature-rail-icon icon-growth"></span>
+        <div>
+          <h3>Improve Productivity</h3>
+          <p>Keep your team aligned in one guided workflow.</p>
+        </div>
+      </article>
+      <article class="feature-rail-card">
+        <span class="feature-rail-icon icon-cap"></span>
+        <div>
+          <h3>Easy to Learn</h3>
+          <p>Use a clean interface built for quick onboarding.</p>
+        </div>
       </article>
     </section>
+
+    <section class="section-block homepage-section feature-section">
+      <div class="section-heading">
+        <span class="eyebrow">Feature Highlights</span>
+        <h2>Built to simplify modern content operations</h2>
+        <p>From first analysis to final output, every step is designed to save time and keep your workflow easy to manage.</p>
+      </div>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <span class="feature-icon icon-time"></span>
+          <h3>Save Time</h3>
+          <p>Reduce repetitive editorial work with guided AI automation across analysis and generation.</p>
+        </article>
+        <article class="feature-card">
+          <span class="feature-icon icon-ai"></span>
+          <h3>AI-Powered Content Generation</h3>
+          <p>Generate headlines, summaries, topics, and long-form outputs from a single source workflow.</p>
+        </article>
+        <article class="feature-card">
+          <span class="feature-icon icon-growth"></span>
+          <h3>Improve Productivity</h3>
+          <p>Give teams a centralized toolset that accelerates content decisions and publishing readiness.</p>
+        </article>
+        <article class="feature-card">
+          <span class="feature-icon icon-star"></span>
+          <h3>Easy to Use</h3>
+          <p>Keep the experience approachable with a clean interface, clear actions, and responsive layouts.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="info-grid homepage-info-grid">
+      <article class="info-card">
+        <span class="eyebrow">About Us</span>
+        <h3>AI tools with a publishing mindset</h3>
+        <p>We build media intelligence products that help teams move faster from raw video and audio to polished deliverables.</p>
+      </article>
+      <article class="info-card">
+        <span class="eyebrow">Blogs</span>
+        <h3>Insights for modern editorial workflows</h3>
+        <p>Discover product thinking, workflow improvements, and AI content strategies tailored for growing teams.</p>
+      </article>
+      <article class="info-card">
+        <span class="eyebrow">Contact Us</span>
+        <h3>Need a custom workflow?</h3>
+        <p>Reach out for implementation help, tailored feature planning, or deeper integration support for your team.</p>
+      </article>
+    </section>
+  `;
+}
+
+function buildFooter() {
+  return `
+    <footer class="site-footer">
+      <div class="footer-brand">
+        <img class="brand-logo-image footer-brand-logo" src="/static/assets/zenpen-logo.png" alt="ZenPen logo" />
+        <div>
+          <p>Professional AI-powered content workflows for modern publishing teams.</p>
+        </div>
+      </div>
+      <div class="footer-links">
+        <div>
+          <span class="footer-title">Quick Links</span>
+          <a href="#/">Home</a>
+          <a href="#/about">About Us</a>
+          <a href="#/blogs">Blogs</a>
+        </div>
+        <div>
+          <span class="footer-title">Products</span>
+          <a href="#/products/article-generator">Article Generator</a>
+          <a href="#/products/blog-generator">Blog Generator</a>
+          <a href="#/products/srt-file-generator">.SRT File Generator</a>
+        </div>
+        <div>
+          <span class="footer-title">Contact</span>
+          <a href="mailto:support@zenpen.ai">support@zenpen.ai</a>
+          <span>Global AI workflow support</span>
+          <span>Copyright (c) 2026 ZENPEN AI</span>
+        </div>
+      </div>
+    </footer>
   `;
 }
 
@@ -270,11 +430,43 @@ function buildAuthPage(mode) {
 function buildDashboard() {
   const session = getSession();
   return `
-    <section class="dashboard-hero">
-      <div>
-        <span class="eyebrow">After Login Dashboard</span>
-        <h1>Welcome, ${escapeHtml(session?.name || session?.email || 'User')}</h1>
-        <p>Choose a product below to continue your workflow.</p>
+    <section class="dashboard-hero hero-surface after-login-hero">
+      <img class="hero-background-image" src="/static/assets/hero-ai-dashboard.png" alt="AI dashboard and robot assistant interface" />
+      <div class="hero-surface-overlay"></div>
+      <div class="hero-copy hero-overlay-card dashboard-overlay-card">
+        <span class="eyebrow">Your AI Workspace</span>
+        <h1>
+          Welcome back,
+          <br />
+          ${escapeHtml(getUserDisplayName(session))}
+        </h1>
+        <p>
+          Pick up where you left off, launch the right tool in seconds, and move from source media to polished output inside one focused workspace.
+        </p>
+        <div class="dashboard-badges">
+          <span>Ready to generate</span>
+          <span>Fast workflow access</span>
+          <span>Built for content teams</span>
+        </div>
+        <div class="hero-actions dashboard-actions">
+          <a class="primary-btn" href="#/products/article-generator">Open Article Generator</a>
+          <a class="ghost-btn" href="#/products/blog-generator">Explore Tools</a>
+        </div>
+        <div class="dashboard-mini-points">
+          <div>
+            <strong>3 Tools</strong>
+            <span>available in your dashboard</span>
+          </div>
+          <div>
+            <strong>AI-First</strong>
+            <span>designed for fast content delivery</span>
+          </div>
+        </div>
+      </div>
+      <div class="floating-tool-card hero-floating-note dashboard-floating-note">
+        <span class="eyebrow">Workspace Ready</span>
+        <strong>Your tools are live</strong>
+        <p>Jump into article generation, blog workflows, or subtitle preparation from your dashboard.</p>
       </div>
     </section>
     <section class="section-block">
@@ -287,14 +479,58 @@ function buildDashboard() {
 
 function buildProductCard(product, requireLogin) {
   const href = requireLogin ? '#/login' : `#/products/${product.slug}`;
+  const productMeta = {
+    'article-generator': {
+      badge: 'AG',
+      badgeClass: 'badge-article',
+      visualClass: 'visual-article',
+      brand: 'Article AI',
+      cta: 'Open Tool',
+    },
+    'blog-generator': {
+      badge: 'BG',
+      badgeClass: 'badge-blog',
+      visualClass: 'visual-blog',
+      brand: 'Blog Studio',
+      cta: 'Try Soon',
+    },
+    'srt-file-generator': {
+      badge: 'SR',
+      badgeClass: 'badge-srt',
+      visualClass: 'visual-srt',
+      brand: 'Caption Flow',
+      cta: 'Try Soon',
+    },
+  }[product.slug];
   return `
     <article class="product-card">
-      <div class="product-banner ${escapeHtml(product.banner)}"></div>
       <div class="product-copy">
-        <span class="product-status ${product.status === 'ready' ? 'status-ready' : 'status-soon'}">${product.status === 'ready' ? 'Available Now' : 'Coming Soon'}</span>
+        <div class="product-topline">
+          <div class="product-brand">
+            <span class="product-badge ${productMeta.badgeClass}">${productMeta.badge}</span>
+            <div>
+              <strong>${productMeta.brand}</strong>
+              <span class="product-accent-line"></span>
+            </div>
+          </div>
+          <span class="product-status ${product.status === 'ready' ? 'status-ready' : 'status-soon'}">${product.status === 'ready' ? 'Available Now' : 'Coming Soon'}</span>
+        </div>
         <h3>${escapeHtml(product.title)}</h3>
         <p>${escapeHtml(product.description)}</p>
-        <a class="primary-btn" href="${href}">${escapeHtml(product.cta)}</a>
+        <div class="product-showcase ${productMeta.visualClass}">
+          <div class="showcase-window">
+            <span class="window-dot"></span>
+            <span class="window-dot"></span>
+            <span class="window-dot"></span>
+          </div>
+          <div class="showcase-body">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div class="showcase-floating-card"></div>
+        </div>
+        <a class="primary-btn" href="${href}">${productMeta.cta}</a>
       </div>
     </article>
   `;
@@ -495,6 +731,20 @@ function buildPageContent(route) {
 }
 
 function renderApp() {
+  if (!appState.initialized) {
+    root.innerHTML = `
+      <div class="page-shell">
+        <main class="page-content">
+          <div class="state-panel loading-state">
+            <div class="loader"></div>
+            <p>Loading your workspace...</p>
+          </div>
+        </main>
+      </div>
+    `;
+    return;
+  }
+
   const route = currentRoute();
   const protectedRoutes = route === '/dashboard' || route.startsWith('/products/');
   if (protectedRoutes && !isAuthenticated()) {
@@ -506,6 +756,7 @@ function renderApp() {
     <div class="page-shell">
       ${buildHeader()}
       <main class="page-content">${buildPageContent(route)}</main>
+      ${buildFooter()}
     </div>
   `;
 }
@@ -525,6 +776,15 @@ function validateAnalysisInput(url, file) {
   return '';
 }
 
+function buildAuthHeaders() {
+  if (hasSupabaseAuth() && appState.session?.access_token) {
+    return {
+      Authorization: `Bearer ${appState.session.access_token}`,
+    };
+  }
+  return {};
+}
+
 async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
   const formData = new FormData();
   if (source.url) formData.append('url', source.url);
@@ -536,6 +796,7 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
 
   const response = await fetch('/api/analyze', {
     method: 'POST',
+    headers: buildAuthHeaders(),
     body: formData,
   });
   const payload = await response.json();
@@ -543,6 +804,21 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
     throw new Error(payload.error || payload.detail || 'Request failed.');
   }
   return payload.result;
+}
+
+async function sendAuthRequest(path, payload) {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.success) {
+    throw new Error(data.detail || data.error || 'Authentication request failed.');
+  }
+  return data.session;
 }
 
 async function handleAnalyzeSubmit(form) {
@@ -623,25 +899,38 @@ async function handleArticleGeneration(form) {
   }
 }
 
-function handleLoginSubmit(form) {
+async function handleLoginSubmit(form) {
   const formData = new FormData(form);
   const email = String(formData.get('email') || '').trim().toLowerCase();
   const password = String(formData.get('password') || '');
+
+  if (hasSupabaseAuth()) {
+    try {
+      const session = await sendAuthRequest('/api/auth/login', { email, password });
+      setSession(session);
+      appState.authError = '';
+      navigate('/dashboard');
+      return;
+    } catch (error) {
+      appState.authError = error.message || 'Invalid email or password.';
+      renderApp();
+      return;
+    }
+  }
+
   const users = getUsers();
   const user = users.find((item) => item.email === email && item.password === password);
-
   if (!user) {
     appState.authError = 'Invalid email or password.';
     renderApp();
     return;
   }
-
   setSession({ name: user.name, email: user.email });
   appState.authError = '';
   navigate('/dashboard');
 }
 
-function handleSignupSubmit(form) {
+async function handleSignupSubmit(form) {
   const formData = new FormData(form);
   const name = String(formData.get('name') || '').trim();
   const email = String(formData.get('email') || '').trim().toLowerCase();
@@ -657,6 +946,20 @@ function handleSignupSubmit(form) {
     appState.authError = 'Passwords do not match.';
     renderApp();
     return;
+  }
+
+  if (hasSupabaseAuth()) {
+    try {
+      const session = await sendAuthRequest('/api/auth/signup', { name, email, password });
+      setSession(session);
+      appState.authError = '';
+      navigate('/dashboard');
+      return;
+    } catch (error) {
+      appState.authError = error.message || 'Could not create your account.';
+      renderApp();
+      return;
+    }
   }
 
   const users = getUsers();
@@ -759,6 +1062,6 @@ window.addEventListener('hashchange', () => {
 attachDelegatedHandlers();
 if (!window.location.hash) {
   navigate('/');
-} else {
-  renderApp();
 }
+renderApp();
+initializeApp();

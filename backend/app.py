@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -18,9 +19,11 @@ except Exception:  # pragma: no cover - optional dependency
 
 import nltk
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import httpx
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from starlette.staticfiles import StaticFiles
 from nltk.tokenize import sent_tokenize
 from dotenv import load_dotenv
@@ -78,6 +81,9 @@ nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -95,6 +101,17 @@ class QuietYtdlpLogger:
         return None
 
 
+class SignupRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 def dependency_status() -> dict[str, bool | str]:
     return {
         "python": sys.executable,
@@ -106,7 +123,327 @@ def dependency_status() -> dict[str, bool | str]:
         "gemini": genai is not None,
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "gemini_api_key_configured": bool(GEMINI_API_KEY),
+        "supabase_configured": supabase_is_configured(),
     }
+
+
+def supabase_is_configured() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY)
+
+
+def get_api_config() -> dict[str, object]:
+    return {
+        "supabase": {
+            "enabled": bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY),
+            "url": SUPABASE_URL or None,
+            "publishableKey": SUPABASE_PUBLISHABLE_KEY or None,
+        }
+    }
+
+
+def get_bearer_token(request: Request) -> Optional[str]:
+    authorization = request.headers.get("Authorization", "").strip()
+    if not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    return token or None
+
+
+def supabase_auth_headers(token: str) -> dict[str, str]:
+    return {
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def supabase_service_headers() -> dict[str, str]:
+    return {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def supabase_public_headers() -> dict[str, str]:
+    return {
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def supabase_auth_request(
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict[str, str]] = None,
+    json_body: Optional[object] = None,
+    admin: bool = False,
+) -> httpx.Response:
+    if not supabase_is_configured():
+        raise RuntimeError("Supabase is not configured")
+
+    headers = supabase_service_headers() if admin else supabase_public_headers()
+    response = httpx.request(
+        method,
+        f"{SUPABASE_URL}/auth/v1/{path}",
+        headers=headers,
+        params=params,
+        json=json_body,
+        timeout=20.0,
+    )
+    return response
+
+
+def extract_supabase_error(response: httpx.Response, default_message: str) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        return default_message
+
+    if isinstance(payload, dict):
+        for key in ("msg", "message", "error_description", "error"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+    return default_message
+
+
+def create_supabase_user(name: str, email: str, password: str) -> dict[str, object]:
+    response = supabase_auth_request(
+        "POST",
+        "admin/users",
+        json_body={
+            "email": email,
+            "password": password,
+            "email_confirm": True,
+            "user_metadata": {
+                "full_name": name,
+            },
+        },
+        admin=True,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail=extract_supabase_error(response, "Could not create your account."),
+        )
+
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def sign_in_supabase_user(email: str, password: str) -> dict[str, object]:
+    response = supabase_auth_request(
+        "POST",
+        "token",
+        params={"grant_type": "password"},
+        json_body={
+            "email": email,
+            "password": password,
+        },
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail=extract_supabase_error(response, "Invalid email or password."),
+        )
+
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def resolve_supabase_user(request: Request) -> Optional[dict[str, object]]:
+    if not supabase_is_configured():
+        return None
+
+    token = get_bearer_token(request)
+    if not token:
+        return None
+
+    try:
+        response = httpx.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers=supabase_auth_headers(token),
+            timeout=15.0,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) and payload.get("id") else None
+    except Exception:
+        return None
+
+
+def supabase_rest_request(
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict[str, str]] = None,
+    json_body: Optional[object] = None,
+) -> object:
+    if not supabase_is_configured():
+        raise RuntimeError("Supabase is not configured")
+
+    response = httpx.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers=supabase_service_headers(),
+        params=params,
+        json=json_body,
+        timeout=20.0,
+    )
+    response.raise_for_status()
+    if not response.content:
+        return None
+    return response.json()
+
+
+@lru_cache(maxsize=8)
+def get_product_id_by_slug(slug: str) -> Optional[str]:
+    rows = supabase_rest_request(
+        "GET",
+        "products",
+        params={
+            "slug": f"eq.{slug}",
+            "select": "id",
+            "limit": "1",
+        },
+    )
+    if isinstance(rows, list) and rows:
+        product_id = rows[0].get("id")
+        return str(product_id) if product_id else None
+    return None
+
+
+def load_history_from_supabase(user_id: str) -> list[dict[str, object]]:
+    rows = supabase_rest_request(
+        "GET",
+        "analysis_jobs",
+        params={
+            "user_id": f"eq.{user_id}",
+            "select": "id,source_type,source_url,source_file_name,headline,summary,created_at",
+            "order": "created_at.desc",
+            "limit": "10",
+        },
+    )
+    history_items: list[dict[str, object]] = []
+    if not isinstance(rows, list):
+        return history_items
+
+    for row in rows:
+        source_type = row.get("source_type") or "url"
+        source_label = "youtube-url" if source_type == "url" else "uploaded-file"
+        history_items.append(
+            {
+                "id": row.get("id"),
+                "source": source_label,
+                "headline": row.get("headline") or "Media summary",
+                "summary": row.get("summary") or "",
+                "created_at": row.get("created_at"),
+            }
+        )
+    return history_items
+
+
+def persist_analysis_to_supabase(
+    *,
+    user_id: str,
+    source_type: str,
+    source_url: Optional[str],
+    source_file_name: Optional[str],
+    source_mime_type: Optional[str],
+    query: str,
+    result: dict[str, object],
+    selected_topics: list[str],
+) -> None:
+    product_id = get_product_id_by_slug("article-generator")
+    if not product_id:
+        raise RuntimeError("The article-generator product row is missing in Supabase.")
+
+    headline = str(result.get("headline") or "Media summary")
+    summary = str(result.get("summary") or "")
+    topics = result.get("topics") if isinstance(result.get("topics"), list) else []
+    articles = result.get("articles") if isinstance(result.get("articles"), list) else []
+
+    inserted_jobs = supabase_rest_request(
+        "POST",
+        "analysis_jobs",
+        json_body=[
+            {
+                "user_id": user_id,
+                "product_id": product_id,
+                "source_type": source_type,
+                "source_url": source_url,
+                "source_file_name": source_file_name,
+                "source_mime_type": source_mime_type,
+                "query": query,
+                "status": "completed",
+                "headline": headline,
+                "summary": summary,
+                "raw_result": result,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    )
+    if not isinstance(inserted_jobs, list) or not inserted_jobs:
+        raise RuntimeError("Supabase did not return the created analysis job.")
+
+    analysis_job_id = inserted_jobs[0].get("id")
+    if not analysis_job_id:
+        raise RuntimeError("Supabase did not return an analysis job id.")
+
+    topic_rows = []
+    selected_lookup = {topic.lower() for topic in selected_topics}
+    for index, topic in enumerate(topics):
+        topic_text = str(topic).strip()
+        if not topic_text:
+            continue
+        topic_rows.append(
+            {
+                "analysis_job_id": analysis_job_id,
+                "topic": topic_text,
+                "sort_order": index,
+                "selected": topic_text.lower() in selected_lookup,
+            }
+        )
+
+    inserted_topics: list[dict[str, object]] = []
+    if topic_rows:
+        rows = supabase_rest_request("POST", "analysis_topics", json_body=topic_rows)
+        if isinstance(rows, list):
+            inserted_topics = rows
+
+    topic_id_by_name = {
+        str(item.get("topic")).lower(): item.get("id")
+        for item in inserted_topics
+        if item.get("topic") and item.get("id")
+    }
+
+    article_rows = []
+    for index, article in enumerate(articles):
+        if not isinstance(article, dict):
+            continue
+        topic = str(article.get("topic") or "").strip()
+        content = str(article.get("content") or "").strip()
+        if not content:
+            continue
+        article_rows.append(
+            {
+                "analysis_job_id": analysis_job_id,
+                "topic_id": topic_id_by_name.get(topic.lower()) if topic else None,
+                "title": headline,
+                "topic": topic or "Main topic",
+                "content": content,
+                "image_url": article.get("image_url"),
+                "sort_order": index,
+            }
+        )
+
+    if article_rows:
+        supabase_rest_request("POST", "generated_articles", json_body=article_rows)
 
 
 def build_missing_dependency_message(package_name: str, extra_hint: Optional[str] = None) -> str:
@@ -512,13 +849,46 @@ def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "dependencies": dependency_status()})
 
 
+@app.get("/api/config")
+def config() -> JSONResponse:
+    return JSONResponse(get_api_config())
+
+
+@app.post("/api/auth/signup")
+def signup(payload: SignupRequest) -> JSONResponse:
+    if not supabase_is_configured():
+        raise HTTPException(status_code=503, detail="Supabase authentication is not configured.")
+    if len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+
+    create_supabase_user(payload.name.strip(), payload.email.strip().lower(), payload.password)
+    session = sign_in_supabase_user(payload.email.strip().lower(), payload.password)
+    return JSONResponse({"success": True, "session": session})
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest) -> JSONResponse:
+    if not supabase_is_configured():
+        raise HTTPException(status_code=503, detail="Supabase authentication is not configured.")
+
+    session = sign_in_supabase_user(payload.email.strip().lower(), payload.password)
+    return JSONResponse({"success": True, "session": session})
+
+
 @app.get("/api/history")
-def history() -> JSONResponse:
+def history(request: Request) -> JSONResponse:
+    user = resolve_supabase_user(request)
+    if user:
+        try:
+            return JSONResponse(load_history_from_supabase(str(user["id"])))
+        except Exception:
+            pass
     return JSONResponse(load_history())
 
 
 @app.post("/api/analyze")
 async def analyze_endpoint(
+    request: Request,
     url: Optional[str] = Form(None),
     query: Optional[str] = Form("Summarize the content"),
     file: Optional[UploadFile] = File(None),
@@ -560,7 +930,23 @@ async def analyze_endpoint(
                 article_count=article_count,
             )
             source = "uploaded-file" if file else "youtube-url"
+            source_type = "upload" if file else "url"
             add_history_entry(result, source)
+            user = resolve_supabase_user(request)
+            if user:
+                try:
+                    persist_analysis_to_supabase(
+                        user_id=str(user["id"]),
+                        source_type=source_type,
+                        source_url=url,
+                        source_file_name=file.filename if file else None,
+                        source_mime_type=file.content_type if file else None,
+                        query=query or "Summarize the content",
+                        result=enriched_result,
+                        selected_topics=topic_list,
+                    )
+                except Exception:
+                    pass
             return JSONResponse({"success": True, "result": enriched_result})
     except Exception as exc:
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)

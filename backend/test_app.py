@@ -15,6 +15,55 @@ def test_health_endpoint():
     assert response.json()['dependencies']['python']
 
 
+def test_config_endpoint_exposes_public_config_only():
+    response = client.get('/api/config')
+    assert response.status_code == 200
+    payload = response.json()
+    assert 'supabase' in payload
+    assert 'publishableKey' in payload['supabase']
+    assert 'SECRET' not in str(payload).upper()
+
+
+def test_login_endpoint_returns_session(monkeypatch):
+    monkeypatch.setattr('app.supabase_is_configured', lambda: True)
+    monkeypatch.setattr(
+        'app.sign_in_supabase_user',
+        lambda email, password: {
+            'access_token': 'token-123',
+            'user': {'email': email, 'user_metadata': {'full_name': 'Test User'}},
+        },
+    )
+
+    response = client.post('/api/auth/login', json={'email': 'test@example.com', 'password': 'secret123'})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert payload['session']['access_token'] == 'token-123'
+
+
+def test_signup_endpoint_creates_account_and_returns_session(monkeypatch):
+    monkeypatch.setattr('app.supabase_is_configured', lambda: True)
+    monkeypatch.setattr('app.create_supabase_user', lambda name, email, password: {'id': 'user-1', 'email': email})
+    monkeypatch.setattr(
+        'app.sign_in_supabase_user',
+        lambda email, password: {
+            'access_token': 'signup-token',
+            'user': {'email': email, 'user_metadata': {'full_name': 'Test User'}},
+        },
+    )
+
+    response = client.post(
+        '/api/auth/signup',
+        json={'name': 'Test User', 'email': 'test@example.com', 'password': 'secret123'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert payload['session']['access_token'] == 'signup-token'
+
+
 def test_history_endpoint():
     response = client.get('/api/history')
     assert response.status_code == 200

@@ -584,6 +584,52 @@ def maybe_write_youtube_cookies_file(output_dir: Path) -> Optional[Path]:
     return cookies_path
 
 
+def normalize_yt_info_entry(info: dict[str, object]) -> dict[str, object]:
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                return entry
+    return info
+
+
+def select_best_audio_format_id(info: dict[str, object]) -> Optional[str]:
+    normalized_info = normalize_yt_info_entry(info)
+    formats = normalized_info.get("formats")
+    if not isinstance(formats, list):
+        return None
+
+    audio_only: list[dict[str, object]] = []
+    muxed_with_audio: list[dict[str, object]] = []
+    for fmt in formats:
+        if not isinstance(fmt, dict):
+            continue
+        acodec = str(fmt.get("acodec") or "none")
+        vcodec = str(fmt.get("vcodec") or "none")
+        format_id = fmt.get("format_id")
+        if not format_id or acodec == "none":
+            continue
+        if vcodec == "none":
+            audio_only.append(fmt)
+        else:
+            muxed_with_audio.append(fmt)
+
+    def format_rank(fmt: dict[str, object]) -> tuple[float, float, int]:
+        abr = float(fmt.get("abr") or 0)
+        tbr = float(fmt.get("tbr") or 0)
+        ext = str(fmt.get("ext") or "")
+        ext_preference = 1 if ext in {"m4a", "mp4", "webm"} else 0
+        return (abr, tbr, ext_preference)
+
+    if audio_only:
+        best = max(audio_only, key=format_rank)
+        return str(best.get("format_id"))
+    if muxed_with_audio:
+        best = max(muxed_with_audio, key=format_rank)
+        return str(best.get("format_id"))
+    return None
+
+
 def download_audio(url: str, output_dir: str) -> str:
     yt_dlp = get_yt_dlp_module()
     ensure_ffmpeg()
@@ -592,8 +638,7 @@ def download_audio(url: str, output_dir: str) -> str:
     output_dir_path.mkdir(parents=True, exist_ok=True)
     cookies_file = maybe_write_youtube_cookies_file(output_dir_path)
     output_template = str(output_dir_path / "downloaded.%(ext)s")
-    ydl_opts = {
-        "format": "bestaudio/best",
+    ydl_base_opts = {
         "outtmpl": output_template,
         "quiet": True,
         "no_warnings": True,
@@ -626,8 +671,14 @@ def download_audio(url: str, output_dir: str) -> str:
         ],
     }
     if cookies_file:
-        ydl_opts["cookiefile"] = str(cookies_file)
+        ydl_base_opts["cookiefile"] = str(cookies_file)
     try:
+        with yt_dlp.YoutubeDL({**ydl_base_opts, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        selected_format_id = select_best_audio_format_id(info)
+        ydl_opts = dict(ydl_base_opts)
+        ydl_opts["format"] = selected_format_id or "bestaudio/best"
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except yt_dlp.utils.DownloadError as exc:
@@ -640,6 +691,11 @@ def download_audio(url: str, output_dir: str) -> str:
             raise RuntimeError(
                 "This YouTube video requires authenticated cookies. Add a Railway env var named "
                 "YOUTUBE_COOKIES_B64 containing base64-encoded Netscape YouTube cookies, then redeploy."
+            ) from exc
+        if "Requested format is not available" in error_text:
+            raise RuntimeError(
+                "The video is available, but YouTube did not expose a compatible downloadable audio format to the server. "
+                "Please retry once, try another video, or upload the media file directly."
             ) from exc
         if "HTTP Error 429" in error_text:
             raise RuntimeError("YouTube is rate-limiting the server right now. Please retry in a moment or upload the file directly.") from exc

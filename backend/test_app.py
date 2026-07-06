@@ -2,9 +2,30 @@ import io
 
 from fastapi.testclient import TestClient
 
-from app import app
+from app import app, select_best_audio_format_id
 
 client = TestClient(app)
+
+
+def test_select_best_audio_format_prefers_audio_only():
+    info = {
+        'formats': [
+            {'format_id': '18', 'acodec': 'aac', 'vcodec': 'h264', 'abr': 96, 'tbr': 300, 'ext': 'mp4'},
+            {'format_id': '140', 'acodec': 'aac', 'vcodec': 'none', 'abr': 128, 'tbr': 128, 'ext': 'm4a'},
+            {'format_id': '251', 'acodec': 'opus', 'vcodec': 'none', 'abr': 160, 'tbr': 160, 'ext': 'webm'},
+        ]
+    }
+    assert select_best_audio_format_id(info) == '251'
+
+
+def test_select_best_audio_format_falls_back_to_muxed():
+    info = {
+        'formats': [
+            {'format_id': '18', 'acodec': 'aac', 'vcodec': 'h264', 'abr': 96, 'tbr': 300, 'ext': 'mp4'},
+            {'format_id': '22', 'acodec': 'aac', 'vcodec': 'h264', 'abr': 192, 'tbr': 800, 'ext': 'mp4'},
+        ]
+    }
+    assert select_best_audio_format_id(info) == '22'
 
 
 def test_health_endpoint():

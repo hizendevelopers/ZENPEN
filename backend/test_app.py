@@ -2,7 +2,7 @@ import io
 
 from fastapi.testclient import TestClient
 
-from app import app, is_youtube_url, select_apify_download_url, select_best_audio_format_id
+from app import app, download_audio, is_youtube_url, select_apify_download_url, select_best_audio_format_id
 
 client = TestClient(app)
 
@@ -40,6 +40,18 @@ def test_is_youtube_url_detects_supported_hosts():
     assert is_youtube_url('https://www.youtube.com/watch?v=abc123') is True
     assert is_youtube_url('https://youtu.be/abc123') is True
     assert is_youtube_url('https://example.com/file.mp3') is False
+
+
+def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.APIFY_TOKEN', 'token')
+    monkeypatch.setattr('app.download_audio_via_apify', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('apify failed')))
+
+    try:
+        download_audio('https://www.youtube.com/watch?v=abc123', str(tmp_path))
+    except RuntimeError as exc:
+        assert 'Apify YouTube download failed' in str(exc)
+    else:
+        raise AssertionError('Expected RuntimeError')
 
 
 def test_health_endpoint():

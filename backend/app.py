@@ -741,12 +741,11 @@ def select_best_audio_format_id(info: dict[str, object]) -> Optional[str]:
 
 
 def download_audio(url: str, output_dir: str) -> str:
-    apify_error: Optional[Exception] = None
     if APIFY_TOKEN and is_youtube_url(url):
         try:
             return download_audio_via_apify(url, output_dir)
         except Exception as exc:
-            apify_error = exc
+            raise RuntimeError(f"Apify YouTube download failed: {exc}") from exc
 
     yt_dlp = get_yt_dlp_module()
     ensure_ffmpeg()
@@ -820,11 +819,6 @@ def download_audio(url: str, output_dir: str) -> str:
             raise RuntimeError(
                 "YouTube blocked this server request. The app has been updated with stronger download support; please retry once. "
                 "If the video still fails, upload the media file directly."
-            ) from exc
-        if apify_error is not None:
-            raise RuntimeError(
-                f"Could not download audio from that YouTube URL. Apify fallback failed with: {apify_error}. "
-                f"yt-dlp details: {error_text}"
             ) from exc
         raise RuntimeError(
             f"Could not download audio from that YouTube URL. Details: {error_text}"

@@ -1,6 +1,6 @@
-# Media Analyzer
+# ZENPEN
 
-A simple media analysis app with a FastAPI backend and a lightweight web frontend.
+AI article, blog, and subtitle generation platform built with a FastAPI backend and a lightweight web frontend.
 
 ## Run locally
 
@@ -22,6 +22,6 @@ Notes:
 ## Run with Docker
 
 ```bash
-docker build -t media-analyzer .
-docker run -p 8000:8000 media-analyzer
+docker build -t zenpen .
+docker run -p 8000:8000 zenpen
 ```

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from redis import Redis
 from rq import Queue
 from rq.job import Job
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / ".env"
+load_dotenv(ENV_FILE)
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 URL_ANALYSIS_QUEUE_NAME = os.getenv("URL_ANALYSIS_QUEUE_NAME", "url-analysis")

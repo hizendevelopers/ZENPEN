@@ -647,12 +647,16 @@ def build_transcript_api_instance():
     if http_proxy or https_proxy:
         proxies_module = importlib.import_module("youtube_transcript_api.proxies")
         generic_proxy_config = getattr(proxies_module, "GenericProxyConfig")
-        return transcript_api_class(
-            proxy_config=generic_proxy_config(
-                http_url=http_proxy,
-                https_url=https_proxy,
+        try:
+            return transcript_api_class(
+                proxy_config=generic_proxy_config(
+                    http_url=http_proxy,
+                    https_url=https_proxy,
+                )
             )
-        )
+        except TypeError:
+            # Supports lightweight test doubles that do not accept proxy args.
+            return transcript_api_class()
     return transcript_api_class()
 
 

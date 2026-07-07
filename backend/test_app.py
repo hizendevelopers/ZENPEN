@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app import (
     analyze_text_content,
     app,
+    analyze_url_source,
     download_audio,
     extract_youtube_video_id,
     fetch_youtube_transcript_text,
@@ -112,6 +113,7 @@ def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp
 
 
 def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
+    monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('download failed')))
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript from YouTube captions.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
@@ -130,6 +132,7 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
 
 
 def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch):
+    monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
@@ -216,6 +219,7 @@ def test_frontend_deep_links_fallback_to_index():
 
 
 def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
+    monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A', 'Topic B'])
@@ -236,6 +240,7 @@ def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
 
 
 def test_analyze_endpoint_falls_back_when_transcript_is_empty(monkeypatch):
+    monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: '')
     monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Main topic'])
 
@@ -253,6 +258,7 @@ def test_analyze_endpoint_falls_back_when_transcript_is_empty(monkeypatch):
 
 
 def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
+    monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
@@ -272,3 +278,70 @@ def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
         'content': 'Article for Topic A',
         'image_url': 'https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=1200&q=80',
     }]
+
+
+def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A', 'Topic B'])
+
+    result = analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
+
+    assert result['topics'] == ['Topic A', 'Topic B']
+    assert result['articles'] == []
+
+
+def test_analyze_endpoint_queues_url_jobs_when_queue_is_available(monkeypatch):
+    class FakeJob:
+        id = 'job-123'
+
+    monkeypatch.setattr('app.queue_is_available', lambda: True)
+    monkeypatch.setattr('app.enqueue_url_analysis', lambda **kwargs: FakeJob())
+
+    response = client.post(
+        '/api/analyze',
+        data={'url': 'https://www.youtube.com/watch?v=abc123', 'query': 'Summarize'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert payload['queued'] is True
+    assert payload['job_id'] == 'job-123'
+
+
+def test_job_status_endpoint_returns_completed_result(monkeypatch):
+    class FakeJob:
+        result = {'headline': 'Ready'}
+
+        def get_status(self, refresh=True):
+            return 'finished'
+
+    monkeypatch.setattr('app.fetch_job', lambda job_id: FakeJob())
+
+    response = client.get('/api/jobs/job-123')
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['status'] == 'completed'
+    assert payload['result']['headline'] == 'Ready'
+
+
+def test_generate_articles_endpoint_returns_articles(monkeypatch):
+    monkeypatch.setattr('app.generate_news_article', lambda headline, summary, topic=None: f'Article for {topic}')
+
+    response = client.post(
+        '/api/articles',
+        json={
+            'headline': 'Summary headline',
+            'summary': '- point 1',
+            'topics': ['Topic A'],
+            'selected_topics': ['Topic A'],
+            'article_count': 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert payload['result']['articles'][0]['content'] == 'Article for Topic A'

@@ -26,6 +26,10 @@ from pydantic import BaseModel
 from starlette.staticfiles import StaticFiles
 from nltk.tokenize import sent_tokenize
 from dotenv import load_dotenv
+from rq.job import Job
+
+from backend.queueing import fetch_job, queue_is_available, queue_is_configured
+from backend.url_jobs import enqueue_url_analysis
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -54,6 +58,10 @@ SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
+YOUTUBE_PROXY_HTTP = os.getenv("YOUTUBE_PROXY_HTTP", "").strip()
+YOUTUBE_PROXY_HTTPS = os.getenv("YOUTUBE_PROXY_HTTPS", "").strip()
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -66,6 +74,14 @@ WHISPER_MODULE = None
 GENAI_MODULE = None
 APIFY_CLIENT_CLASS = None
 YOUTUBE_TRANSCRIPT_API_CLASS = None
+
+
+class ArticlesRequest(BaseModel):
+    headline: str
+    summary: str
+    topics: list[str] = []
+    selected_topics: list[str]
+    article_count: int = 1
 
 
 class QuietYtdlpLogger:
@@ -104,6 +120,9 @@ def dependency_status() -> dict[str, bool | str]:
         "apify_configured": bool(APIFY_TOKEN),
         "youtube_transcript_api": module_available("youtube_transcript_api"),
         "supabase_configured": supabase_is_configured(),
+        "redis_queue_configured": queue_is_configured(),
+        "redis_queue_available": queue_is_available(),
+        "youtube_proxy_configured": bool(get_proxy_url("http") or get_proxy_url("https")),
     }
 
 
@@ -212,7 +231,10 @@ def get_api_config() -> dict[str, object]:
             "enabled": bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY),
             "url": SUPABASE_URL or None,
             "publishableKey": SUPABASE_PUBLISHABLE_KEY or None,
-        }
+        },
+        "queue": {
+            "enabled": queue_is_available(),
+        },
     }
 
 
@@ -531,6 +553,12 @@ def build_missing_dependency_message(package_name: str, extra_hint: Optional[str
     return message
 
 
+def get_proxy_url(scheme: str = "https") -> Optional[str]:
+    if scheme == "https":
+        return YOUTUBE_PROXY_HTTPS or YOUTUBE_PROXY_URL or YOUTUBE_PROXY_HTTP or None
+    return YOUTUBE_PROXY_HTTP or YOUTUBE_PROXY_URL or YOUTUBE_PROXY_HTTPS or None
+
+
 def ensure_ffmpeg() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError(
@@ -612,6 +640,22 @@ def maybe_write_youtube_cookies_file(output_dir: Path) -> Optional[Path]:
     return cookies_path
 
 
+def build_transcript_api_instance():
+    transcript_api_class = get_youtube_transcript_api_class()
+    http_proxy = get_proxy_url("http")
+    https_proxy = get_proxy_url("https")
+    if http_proxy or https_proxy:
+        proxies_module = importlib.import_module("youtube_transcript_api.proxies")
+        generic_proxy_config = getattr(proxies_module, "GenericProxyConfig")
+        return transcript_api_class(
+            proxy_config=generic_proxy_config(
+                http_url=http_proxy,
+                https_url=https_proxy,
+            )
+        )
+    return transcript_api_class()
+
+
 def is_youtube_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return "youtube.com" in host or "youtu.be" in host
@@ -639,8 +683,7 @@ def fetch_youtube_transcript_text(url: str) -> str:
     if not video_id:
         raise RuntimeError("Could not extract a valid YouTube video id from the URL.")
 
-    transcript_api_class = get_youtube_transcript_api_class()
-    transcript_api = transcript_api_class()
+    transcript_api = build_transcript_api_instance()
     try:
         transcript_entries = transcript_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
     except Exception:
@@ -718,7 +761,13 @@ def infer_download_suffix(download_url: str, fallback: str = ".mp3") -> str:
 
 
 def download_file_to_path(download_url: str, destination: Path) -> Path:
-    with httpx.stream("GET", download_url, follow_redirects=True, timeout=120.0) as response:
+    with httpx.stream(
+        "GET",
+        download_url,
+        follow_redirects=True,
+        timeout=120.0,
+        proxy=get_proxy_url("https"),
+    ) as response:
         if response.status_code >= 400:
             text = response.text.strip()
             preview = text[:300] if text else f"HTTP {response.status_code}"
@@ -743,6 +792,7 @@ def select_apify_kv_media_url(store_id: str) -> Optional[str]:
         f"https://api.apify.com/v2/key-value-stores/{store_id}/keys",
         params={"token": APIFY_TOKEN},
         timeout=30.0,
+        proxy=get_proxy_url("https"),
     )
     response.raise_for_status()
     payload = parse_json_response_or_raise(response, "Apify key-value store listing")
@@ -921,6 +971,9 @@ def download_audio(url: str, output_dir: str) -> str:
     }
     if cookies_file:
         ydl_base_opts["cookiefile"] = str(cookies_file)
+    proxy_url = get_proxy_url("https")
+    if proxy_url:
+        ydl_base_opts["proxy"] = proxy_url
     try:
         with yt_dlp.YoutubeDL({**ydl_base_opts, "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -1258,6 +1311,67 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content") 
         return fallback_summary(transcript, query)
 
 
+def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[str, object]:
+    transcript_override: Optional[str] = None
+    temp_audio_path: Optional[str] = None
+
+    with tempfile.TemporaryDirectory(prefix="media-analyzer-url-") as temp_dir:
+        if is_youtube_url(url):
+            transcript_error: Optional[Exception] = None
+            try:
+                transcript_override = fetch_youtube_transcript_text(url)
+            except Exception as exc:
+                transcript_error = exc
+                try:
+                    temp_audio_path = download_audio(url, temp_dir)
+                except Exception as download_exc:
+                    raise RuntimeError(
+                        f"YouTube transcript fallback failed: {transcript_error}. "
+                        f"Media download fallback failed: {download_exc}"
+                    ) from download_exc
+        else:
+            temp_audio_path = download_audio(url, temp_dir)
+
+        if transcript_override is not None:
+            result = analyze_text_content(
+                transcript_override,
+                query=query or "Summarize the content",
+            )
+        else:
+            result = analyze_media(
+                local_audio_path=temp_audio_path,
+                query=query or "Summarize the content",
+            )
+
+    return enrich_analysis(result, generate_article=False)
+
+
+def serialize_job_status(job: Job) -> dict[str, object]:
+    status = job.get_status(refresh=True)
+    if status == "finished":
+        return {
+            "success": True,
+            "status": "completed",
+            "result": job.result,
+        }
+
+    if status == "failed":
+        last_line = ""
+        if job.exc_info:
+            last_line = job.exc_info.strip().splitlines()[-1]
+        return {
+            "success": False,
+            "status": "failed",
+            "error": last_line or "Background job failed.",
+        }
+
+    return {
+        "success": True,
+        "status": status,
+        "queued": True,
+    }
+
+
 async def save_uploaded_file(upload: UploadFile, destination: Path) -> None:
     content = await upload.read()
     destination.write_bytes(content)
@@ -1313,6 +1427,37 @@ def history(request: Request) -> JSONResponse:
     return JSONResponse(load_history())
 
 
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str) -> JSONResponse:
+    job = fetch_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Analysis job not found.")
+    payload = serialize_job_status(job)
+    status_code = 200 if payload.get("success", True) else 500
+    return JSONResponse(payload, status_code=status_code)
+
+
+@app.post("/api/articles")
+def generate_articles_endpoint(payload: ArticlesRequest) -> JSONResponse:
+    selected_topics = [topic.strip() for topic in payload.selected_topics if topic.strip()]
+    if not selected_topics:
+        raise HTTPException(status_code=400, detail="Select at least one topic before generating articles.")
+
+    base_result = {
+        "headline": payload.headline.strip() or "Media summary",
+        "summary": payload.summary.strip(),
+    }
+    enriched_result = enrich_analysis(
+        base_result,
+        generate_article=True,
+        selected_topics=selected_topics,
+        article_count=payload.article_count,
+    )
+    if payload.topics:
+        enriched_result["topics"] = payload.topics
+    return JSONResponse({"success": True, "result": enriched_result})
+
+
 @app.post("/api/analyze")
 async def analyze_endpoint(
     request: Request,
@@ -1327,10 +1472,27 @@ async def analyze_endpoint(
         raise HTTPException(status_code=400, detail="Please provide a URL or upload an audio/video file")
 
     try:
+        user = resolve_supabase_user(request)
+        if url and not file and queue_is_available():
+            job = enqueue_url_analysis(
+                url=url,
+                query=query or "Summarize the content",
+                user_id=str(user["id"]) if user else None,
+            )
+            return JSONResponse(
+                {
+                    "success": True,
+                    "queued": True,
+                    "job_id": job.id,
+                    "status": "queued",
+                    "poll_url": f"/api/jobs/{job.id}",
+                }
+            )
+
         with tempfile.TemporaryDirectory(prefix="media-analyzer-") as temp_dir:
             temp_dir_path = Path(temp_dir)
             temp_audio_path: Optional[str] = None
-            transcript_override: Optional[str] = None
+            topic_list = [topic.strip() for topic in (selected_topics or "").split(",") if topic.strip()]
 
             if file:
                 suffix = Path(file.filename or "upload.wav").suffix.lower() or ".wav"
@@ -1343,44 +1505,38 @@ async def analyze_endpoint(
                     )
                 else:
                     temp_audio_path = str(upload_path)
-            elif url:
-                if is_youtube_url(url):
-                    transcript_error: Optional[Exception] = None
-                    try:
-                        transcript_override = fetch_youtube_transcript_text(url)
-                    except Exception as exc:
-                        transcript_error = exc
-                        try:
-                            temp_audio_path = download_audio(url, temp_dir)
-                        except Exception as download_exc:
-                            raise RuntimeError(
-                                f"YouTube transcript fallback failed: {transcript_error}. "
-                                f"Media download fallback failed: {download_exc}"
-                            ) from download_exc
-                else:
-                    temp_audio_path = download_audio(url, temp_dir)
-
-            if transcript_override is not None:
-                result = analyze_text_content(
-                    transcript_override,
-                    query=query or "Summarize the content",
-                )
-            else:
                 result = analyze_media(
                     local_audio_path=temp_audio_path,
                     query=query or "Summarize the content",
                 )
-            topic_list = [topic.strip() for topic in (selected_topics or "").split(",") if topic.strip()]
-            enriched_result = enrich_analysis(
-                result,
-                generate_article=generate_article,
-                selected_topics=topic_list or None,
-                article_count=article_count,
-            )
+                enriched_result = enrich_analysis(
+                    result,
+                    generate_article=generate_article,
+                    selected_topics=topic_list or None,
+                    article_count=article_count,
+                )
+            elif url:
+                enriched_result = analyze_url_source(url, query or "Summarize the content")
+                if generate_article:
+                    existing_topics = list(enriched_result.get("topics") or [])
+                    base_result = {
+                        "headline": str(enriched_result.get("headline") or "Media summary"),
+                        "summary": str(enriched_result.get("summary") or ""),
+                    }
+                    enriched_result = enrich_analysis(
+                        base_result,
+                        generate_article=True,
+                        selected_topics=topic_list or None,
+                        article_count=article_count,
+                    )
+                    enriched_result["topics"] = existing_topics
             source = "uploaded-file" if file else "youtube-url"
             source_type = "upload" if file else "url"
-            add_history_entry(result, source)
-            user = resolve_supabase_user(request)
+            result_for_history = {
+                "headline": str(enriched_result.get("headline") or "Media summary"),
+                "summary": str(enriched_result.get("summary") or ""),
+            }
+            add_history_entry(result_for_history, source)
             if user:
                 try:
                     persist_analysis_to_supabase(

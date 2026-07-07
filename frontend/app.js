@@ -49,6 +49,7 @@ const appState = {
   },
   lastSubmission: null,
   selectedTopics: [],
+  activeJobId: '',
 };
 
 function escapeHtml(value) {
@@ -155,6 +156,7 @@ function resetGeneratorState() {
   appState.busyMessage = '';
   appState.selectedTopics = [];
   appState.lastSubmission = null;
+  appState.activeJobId = '';
 }
 
 function parseSummaryToList(summary) {
@@ -810,6 +812,47 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
     const message = payload?.error || payload?.detail || responseText || 'Request failed.';
     throw new Error(message);
   }
+  return payload;
+}
+
+async function pollAnalysisJob(jobId) {
+  for (;;) {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      headers: buildAuthHeaders(),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok && payload?.status !== 'failed') {
+      throw new Error(payload?.detail || payload?.error || 'Could not read job status.');
+    }
+    if (payload.status === 'completed') {
+      return payload.result;
+    }
+    if (payload.status === 'failed') {
+      throw new Error(payload.error || 'Background analysis failed.');
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 2500));
+  }
+}
+
+async function sendGenerateArticlesRequest({ headline, summary, topics, selectedTopics, articleCount }) {
+  const response = await fetch('/api/articles', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...buildAuthHeaders(),
+    },
+    body: JSON.stringify({
+      headline,
+      summary,
+      topics,
+      selected_topics: selectedTopics,
+      article_count: Number(articleCount || 1),
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.success) {
+    throw new Error(payload?.detail || payload?.error || 'Article generation failed.');
+  }
   return payload.result;
 }
 
@@ -853,14 +896,23 @@ async function handleAnalyzeSubmit(form) {
   try {
     const source = { url, query, file };
     appState.lastSubmission = source;
-    const result = await sendAnalyzeRequest({ generateArticle: false, selectedTopics: [], source });
+    const payload = await sendAnalyzeRequest({ generateArticle: false, selectedTopics: [], source });
+    let result = payload.result;
+    if (payload.queued && payload.job_id) {
+      appState.activeJobId = payload.job_id;
+      appState.busyMessage = 'Your URL is being processed in the background. We will load the analysis automatically...';
+      renderApp();
+      result = await pollAnalysisJob(payload.job_id);
+    }
     appState.analysisResult = result;
     appState.selectedTopics = result.topics ? result.topics.slice(0, 3) : [];
+    appState.activeJobId = '';
     appState.busyMode = '';
     appState.busyMessage = '';
     renderApp();
   } catch (error) {
     appState.analysisError = error.message;
+    appState.activeJobId = '';
     appState.busyMode = '';
     appState.busyMessage = '';
     renderApp();
@@ -868,7 +920,7 @@ async function handleAnalyzeSubmit(form) {
 }
 
 async function handleArticleGeneration(form) {
-  if (!appState.lastSubmission) {
+  if (!appState.analysisResult) {
     appState.articleError = 'Analyze content first before generating articles.';
     renderApp();
     return;
@@ -889,10 +941,12 @@ async function handleArticleGeneration(form) {
   renderApp();
 
   try {
-    const result = await sendAnalyzeRequest({
-      generateArticle: true,
+    const result = await sendGenerateArticlesRequest({
+      headline: appState.analysisResult?.headline || 'Media summary',
+      summary: appState.analysisResult?.summary || '',
+      topics: appState.analysisResult?.topics || [],
       selectedTopics,
-      source: appState.lastSubmission,
+      articleCount: appState.formValues.articleCount,
     });
     appState.analysisResult = result;
     appState.busyMode = '';

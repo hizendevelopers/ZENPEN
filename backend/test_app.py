@@ -7,6 +7,7 @@ from app import (
     app,
     download_audio,
     extract_youtube_video_id,
+    fetch_youtube_transcript_text,
     find_http_urls_in_payload,
     is_youtube_url,
     select_any_non_youtube_url,
@@ -83,6 +84,19 @@ def test_extract_youtube_video_id_supports_multiple_formats():
 def test_analyze_text_content_uses_fallback_summary_when_empty():
     result = analyze_text_content('', 'Summarize')
     assert result['headline'] == 'Key takeaways for: Summarize'
+
+
+def test_fetch_youtube_transcript_text_uses_fetch_api(monkeypatch):
+    class FakeSnippet:
+        def __init__(self, text):
+            self.text = text
+
+    class FakeApi:
+        def fetch(self, video_id, languages=('en',), preserve_formatting=False):
+            return [FakeSnippet('Hello'), FakeSnippet('world')]
+
+    monkeypatch.setattr('app.get_youtube_transcript_api_class', lambda: FakeApi)
+    assert fetch_youtube_transcript_text('https://www.youtube.com/watch?v=abc123') == 'Hello world'
 
 
 def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp_path):

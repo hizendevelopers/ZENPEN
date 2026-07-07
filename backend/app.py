@@ -639,19 +639,17 @@ def fetch_youtube_transcript_text(url: str) -> str:
     if not video_id:
         raise RuntimeError("Could not extract a valid YouTube video id from the URL.")
 
-    transcript_api = get_youtube_transcript_api_class()
+    transcript_api_class = get_youtube_transcript_api_class()
+    transcript_api = transcript_api_class()
     try:
-        transcript_entries = transcript_api.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+        transcript_entries = transcript_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
     except Exception:
-        transcript_entries = transcript_api.get_transcript(video_id)
-
-    if not isinstance(transcript_entries, list):
-        raise RuntimeError("Transcript service returned an unexpected response.")
+        transcript_entries = transcript_api.fetch(video_id)
 
     transcript_text = " ".join(
-        str(item.get("text", "")).replace("\n", " ").strip()
+        str(getattr(item, "text", "")).replace("\n", " ").strip()
         for item in transcript_entries
-        if isinstance(item, dict) and item.get("text")
+        if getattr(item, "text", "")
     ).strip()
     if not transcript_text:
         raise RuntimeError("No transcript text was available for this YouTube video.")

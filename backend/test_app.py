@@ -129,6 +129,23 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
     assert payload['result']['topics'] == ['Topic A']
 
 
+def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch):
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+
+    response = client.post(
+        '/api/analyze',
+        data={'url': 'https://www.youtube.com/watch?v=abc123', 'query': 'Summarize'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert payload['result']['topics'] == ['Topic A']
+
+
 def test_health_endpoint():
     response = client.get('/api/health')
     assert response.status_code == 200

@@ -1344,13 +1344,21 @@ async def analyze_endpoint(
                 else:
                     temp_audio_path = str(upload_path)
             elif url:
-                try:
-                    temp_audio_path = download_audio(url, temp_dir)
-                except Exception:
-                    if is_youtube_url(url):
+                if is_youtube_url(url):
+                    transcript_error: Optional[Exception] = None
+                    try:
                         transcript_override = fetch_youtube_transcript_text(url)
-                    else:
-                        raise
+                    except Exception as exc:
+                        transcript_error = exc
+                        try:
+                            temp_audio_path = download_audio(url, temp_dir)
+                        except Exception as download_exc:
+                            raise RuntimeError(
+                                f"YouTube transcript fallback failed: {transcript_error}. "
+                                f"Media download fallback failed: {download_exc}"
+                            ) from download_exc
+                else:
+                    temp_audio_path = download_audio(url, temp_dir)
 
             if transcript_override is not None:
                 result = analyze_text_content(

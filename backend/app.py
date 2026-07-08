@@ -65,6 +65,7 @@ YOUTUBE_PROXY_HTTPS = os.getenv("YOUTUBE_PROXY_HTTPS", "").strip()
 FAST_ANALYSIS_MODE = os.getenv("FAST_ANALYSIS_MODE", "true").strip().lower() not in {"0", "false", "no", "off"}
 FAST_ANALYSIS_TRANSCRIPT_LIMIT = int(os.getenv("FAST_ANALYSIS_TRANSCRIPT_LIMIT", "5000"))
 FAST_ANALYSIS_CHUNK_LIMIT = int(os.getenv("FAST_ANALYSIS_CHUNK_LIMIT", "6"))
+ENABLE_BACKGROUND_URL_JOBS = os.getenv("ENABLE_BACKGROUND_URL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -125,6 +126,7 @@ def dependency_status() -> dict[str, bool | str]:
         "supabase_configured": supabase_is_configured(),
         "redis_queue_configured": queue_is_configured(),
         "redis_queue_available": queue_is_available(),
+        "background_url_jobs_enabled": ENABLE_BACKGROUND_URL_JOBS,
         "youtube_proxy_configured": bool(get_proxy_url("http") or get_proxy_url("https")),
     }
 
@@ -236,9 +238,13 @@ def get_api_config() -> dict[str, object]:
             "publishableKey": SUPABASE_PUBLISHABLE_KEY or None,
         },
         "queue": {
-            "enabled": queue_is_available(),
+            "enabled": ENABLE_BACKGROUND_URL_JOBS and queue_is_available(),
         },
     }
+
+
+def background_url_jobs_available() -> bool:
+    return ENABLE_BACKGROUND_URL_JOBS and queue_is_available()
 
 
 def get_bearer_token(request: Request) -> Optional[str]:
@@ -1492,7 +1498,7 @@ async def analyze_endpoint(
 
     try:
         user = resolve_supabase_user(request)
-        if url and not file and queue_is_available():
+        if url and not file and background_url_jobs_available():
             job = enqueue_url_analysis(
                 url=url,
                 query=query or "Summarize the content",

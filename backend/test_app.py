@@ -295,7 +295,7 @@ def test_analyze_endpoint_queues_url_jobs_when_queue_is_available(monkeypatch):
     class FakeJob:
         id = 'job-123'
 
-    monkeypatch.setattr('app.queue_is_available', lambda: True)
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: True)
     monkeypatch.setattr('app.enqueue_url_analysis', lambda **kwargs: FakeJob())
 
     response = client.post(

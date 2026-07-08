@@ -62,6 +62,9 @@ REDIS_URL = os.getenv("REDIS_URL", "").strip()
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
 YOUTUBE_PROXY_HTTP = os.getenv("YOUTUBE_PROXY_HTTP", "").strip()
 YOUTUBE_PROXY_HTTPS = os.getenv("YOUTUBE_PROXY_HTTPS", "").strip()
+FAST_ANALYSIS_MODE = os.getenv("FAST_ANALYSIS_MODE", "true").strip().lower() not in {"0", "false", "no", "off"}
+FAST_ANALYSIS_TRANSCRIPT_LIMIT = int(os.getenv("FAST_ANALYSIS_TRANSCRIPT_LIMIT", "5000"))
+FAST_ANALYSIS_CHUNK_LIMIT = int(os.getenv("FAST_ANALYSIS_CHUNK_LIMIT", "6"))
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -1112,6 +1115,13 @@ def fallback_article(headline_text: str, summary_text: str, topic: Optional[str]
     )
 
 
+def build_fast_context_from_transcript(transcript: str, chunks: list[str]) -> str:
+    if transcript.strip():
+        normalized = " ".join(transcript.split())
+        return normalized[:FAST_ANALYSIS_TRANSCRIPT_LIMIT]
+    return " ".join(chunks[:FAST_ANALYSIS_CHUNK_LIMIT])
+
+
 def build_article_image_url(topic: Optional[str]) -> str:
     topic_text = (topic or "news article").lower()
     image_map = [
@@ -1147,7 +1157,6 @@ Summary:
 - point 2
 - point 3
 """
-    time.sleep(3)
     response = client.models.generate_content(
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         contents=prompt,
@@ -1187,7 +1196,7 @@ Summary:
 {summary_text}
 
 Instructions:
-- Write at least 300 words.
+- Write roughly 220 to 320 words.
 - Use a journalistic tone.
 - Start directly with the article.
 - Include context, implications, and balanced perspective.
@@ -1207,6 +1216,9 @@ Instructions:
 
 
 def get_topics_from_summary(summary_text: str) -> list[str]:
+    if FAST_ANALYSIS_MODE:
+        return fallback_topics(summary_text)
+
     prompt = f"""Extract 3 to 5 distinct key topics from the summary below.
 Return only a comma-separated list with no extra commentary.
 
@@ -1253,6 +1265,15 @@ def enrich_analysis(result: dict[str, str], generate_article: bool = False, sele
     return payload
 
 
+def build_analysis_context(transcript: str, chunks: list[str], query: str) -> str:
+    if FAST_ANALYSIS_MODE:
+        return build_fast_context_from_transcript(transcript, chunks)
+
+    embeddings = get_embeddings(chunks)
+    index = build_faiss_index(embeddings)
+    return retrieve_context(query, chunks, index)
+
+
 def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[str] = None, query: str = "Summarize the content") -> dict[str, str]:
     audio_source_path = None
     if local_audio_path:
@@ -1266,9 +1287,7 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
                 return fallback_summary("", query)
             chunks = chunk_text(transcript)
             try:
-                embeddings = get_embeddings(chunks)
-                index = build_faiss_index(embeddings)
-                context = retrieve_context(query, chunks, index)
+                context = build_analysis_context(transcript, chunks, query)
             except Exception:
                 context = " ".join(chunks[:3])
             try:
@@ -1285,9 +1304,7 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
 
     chunks = chunk_text(transcript)
     try:
-        embeddings = get_embeddings(chunks)
-        index = build_faiss_index(embeddings)
-        context = retrieve_context(query, chunks, index)
+        context = build_analysis_context(transcript, chunks, query)
     except Exception:
         context = " ".join(chunks[:3])
 
@@ -1303,9 +1320,7 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content") 
 
     chunks = chunk_text(transcript)
     try:
-        embeddings = get_embeddings(chunks)
-        index = build_faiss_index(embeddings)
-        context = retrieve_context(query, chunks, index)
+        context = build_analysis_context(transcript, chunks, query)
     except Exception:
         context = " ".join(chunks[:3])
 

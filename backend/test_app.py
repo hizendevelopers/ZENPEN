@@ -291,6 +291,19 @@ def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
     assert result['articles'] == []
 
 
+def test_analyze_url_source_uses_subtitles_before_media_download(monkeypatch):
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
+    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: 'Subtitle transcript available immediately.')
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+
+    result = analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
+
+    assert result['topics'] == ['Topic A']
+    assert result['articles'] == []
+
+
 def test_analyze_endpoint_queues_url_jobs_when_queue_is_available(monkeypatch):
     class FakeJob:
         id = 'job-123'

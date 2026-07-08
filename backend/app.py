@@ -712,6 +712,92 @@ def fetch_youtube_transcript_text(url: str) -> str:
     return transcript_text
 
 
+def clean_vtt_caption_text(raw_text: str) -> str:
+    cleaned_lines: list[str] = []
+    seen_recent: str = ""
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "WEBVTT" or line.startswith(("Kind:", "Language:")):
+            continue
+        if "-->" in line:
+            continue
+        line = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", " ", line)
+        line = re.sub(r"</?c[^>]*>", "", line)
+        line = re.sub(r"</?[^>]+>", "", line)
+        line = " ".join(line.split()).strip()
+        if not line:
+            continue
+        if line == seen_recent:
+            continue
+        cleaned_lines.append(line)
+        seen_recent = line
+    return " ".join(cleaned_lines).strip()
+
+
+def fetch_youtube_subtitles_text(url: str, output_dir: str) -> str:
+    yt_dlp = get_yt_dlp_module()
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    cookies_file = maybe_write_youtube_cookies_file(output_dir_path)
+
+    def build_subtitle_opts(proxy_url: Optional[str]) -> dict[str, object]:
+        opts: dict[str, object] = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en", "en-US", "en-GB"],
+            "subtitlesformat": "vtt",
+            "outtmpl": str(output_dir_path / "subtitle-download.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "socket_timeout": 30,
+            "retries": 2,
+            "logger": QuietYtdlpLogger(),
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/127.0.0.0 Safari/537.36"
+                )
+            },
+        }
+        if cookies_file:
+            opts["cookiefile"] = str(cookies_file)
+        if proxy_url:
+            opts["proxy"] = proxy_url
+        return opts
+
+    direct_error: Optional[Exception] = None
+    try:
+        with yt_dlp.YoutubeDL(build_subtitle_opts(None)) as ydl:
+            ydl.extract_info(url, download=True)
+    except Exception as exc:
+        direct_error = exc
+        proxy_url = get_proxy_url("https")
+        if not proxy_url:
+            raise
+        with yt_dlp.YoutubeDL(build_subtitle_opts(proxy_url)) as ydl:
+            ydl.extract_info(url, download=True)
+
+    subtitle_files = sorted(output_dir_path.glob("*.vtt"))
+    if not subtitle_files:
+        if direct_error:
+            raise RuntimeError(f"No YouTube subtitle file was available for this video. Direct subtitle fetch failed: {direct_error}")
+        raise RuntimeError("No YouTube subtitle file was available for this video.")
+
+    best_text = ""
+    for subtitle_file in subtitle_files:
+        subtitle_text = clean_vtt_caption_text(subtitle_file.read_text(encoding="utf-8", errors="ignore"))
+        if len(subtitle_text) > len(best_text):
+            best_text = subtitle_text
+    if not best_text:
+        raise RuntimeError("YouTube subtitle download succeeded, but no readable subtitle text was found.")
+    return best_text
+
+
 def select_apify_download_url(item: dict[str, object]) -> Optional[str]:
     candidate_keys = (
         "downloadUrl",
@@ -1348,12 +1434,21 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
             except Exception as exc:
                 transcript_error = exc
                 try:
-                    temp_audio_path = download_audio(url, temp_dir)
-                except Exception as download_exc:
+                    transcript_override = fetch_youtube_subtitles_text(url, temp_dir)
+                except Exception as subtitle_exc:
+                    try:
+                        temp_audio_path = download_audio(url, temp_dir)
+                    except Exception as download_exc:
+                        raise RuntimeError(
+                            f"YouTube transcript fallback failed: {transcript_error}. "
+                            f"YouTube subtitle fallback failed: {subtitle_exc}. "
+                            f"Media download fallback failed: {download_exc}"
+                        ) from download_exc
+                if transcript_override is None and temp_audio_path is None:
                     raise RuntimeError(
                         f"YouTube transcript fallback failed: {transcript_error}. "
-                        f"Media download fallback failed: {download_exc}"
-                    ) from download_exc
+                        f"YouTube subtitle fallback failed: {subtitle_exc}"
+                    ) from subtitle_exc
         else:
             temp_audio_path = download_audio(url, temp_dir)
 

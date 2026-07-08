@@ -1413,18 +1413,26 @@ def fallback_article(headline_text: str, summary_text: str, topic: Optional[str]
     summary_points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")]
     body_points = summary_points or ["No summary details were available from the source."]
     lead = body_points[0]
-    support = " ".join(body_points[1:3]) if len(body_points) > 1 else lead
-    detail_block = " ".join(body_points)
+    support = body_points[1] if len(body_points) > 1 else lead
+    detail = body_points[2] if len(body_points) > 2 else support
+    closing_support = body_points[3] if len(body_points) > 3 else detail
     return sanitize_article_html(
         f"""
 <h2>{headline_text}</h2>
-<p>{lead} This article stays focused on <strong>{topic_title}</strong> and builds directly from the ideas presented in the source material.</p>
-<h3>Why This Topic Stands Out</h3>
-<p>{support} The source treats this angle as central to the wider discussion, making it a strong basis for a professional article.</p>
-<h3>Key Developments</h3>
-<p>{detail_block} Together, these details create a clear narrative that can be understood quickly without losing depth.</p>
-<h3>What It Suggests</h3>
-<p>The discussion around <strong>{topic_title}</strong> points to a larger trend or consequence that deserves continued attention as the story develops.</p>
+<p>{lead} That opening point sets the tone for a larger discussion around <strong>{topic_title}</strong>, where speed, scale, and long-term ambition appear to converge in a way that reshapes how the wider story should be understood. Rather than standing alone as an isolated observation, it frames the subject as part of a broader shift with political, economic, or social weight.</p>
+<p>{support} Read together, these details suggest that the subject is not simply about one event or one talking point. It is about a pattern that has been building over time, gathering momentum through visible examples and practical outcomes. That gives the article room to move beyond surface description and into a more serious explanation of why the subject matters.</p>
+<h3>The Force Behind the Change</h3>
+<p>{detail} The most compelling aspect of <strong>{topic_title}</strong> is the way it connects visible results with a deeper system of planning, coordination, and intent. What stands out is not only what happened, but how quickly or decisively it happened, and what that says about the institutions, priorities, or pressures operating beneath the surface.</p>
+<p>That matters because readers rarely respond to raw facts alone. They respond to meaning. When a source presents a sequence of developments like this, the real task is to show how each example strengthens the central argument. In this case, the pattern points toward a subject that is larger than a single headline and more durable than a passing moment.</p>
+<h3>What the Examples Reveal</h3>
+<p>{lead} {support} These examples give the article substance. They show how the selected topic plays out in concrete terms, turning abstract discussion into something readers can picture and assess. That shift from claim to example is what gives the writing authority.</p>
+<p>{detail} {closing_support} Taken together, these details suggest a story shaped by visible transformation, discipline, and a willingness to think in terms of outcomes rather than slogans. The selected topic becomes more persuasive because it is supported by examples that feel grounded rather than decorative.</p>
+<h3>Why the Topic Carries Weight</h3>
+<p>The importance of <strong>{topic_title}</strong> lies in how it opens a wider conversation. It helps explain not just what changed, but why the change deserves attention now. Topics like this often matter because they reveal how power works, how priorities are set, or how societies attempt to move from ambition to execution.</p>
+<p>That is what gives the piece lasting value. A strong article does more than repeat highlights. It gives readers a coherent way to understand them. Here, the core material points toward a subject that rewards close attention because it sits at the intersection of visible change and the deeper structures that made that change possible.</p>
+<h3>The Broader Meaning</h3>
+<p>{closing_support} The final impression is not of a narrow issue, but of a subject with consequences that extend outward into public life, economic direction, and the language of progress itself. That is why <strong>{topic_title}</strong> works as a serious article subject: it contains both immediate interest and deeper analytical value.</p>
+<p>The strongest closing point is that the selected topic does not need artificial drama to feel significant. Its significance comes from the weight of the ideas attached to it and from the examples that give those ideas shape. A well-written article can build on that foundation naturally, leaving the reader with a sharper understanding of the issue and a clearer sense of why it deserves continued attention.</p>
 """
     )
 
@@ -1519,11 +1527,16 @@ Instructions:
 - Do not invent facts, quotes, names, or unsupported claims.
 - Write in a natural, human, professional editorial style.
 - Avoid robotic filler phrases and generic transitions.
+- Do not write a topic brief, content plan, analysis note, or summary card.
+- Do not use headings such as "Why This Topic Stands Out", "Key Developments", "What It Suggests", or similar template labels.
+- Do not say "this article discusses", "the source material says", "the selected topic is", or any other meta-writing phrase.
+- Write at least 900 words unless brevity is absolutely necessary for factual accuracy.
 - Include:
   - one strong <h2> headline
-  - a short opening paragraph
-  - 2 to 4 meaningful <h3> section headings
-  - body paragraphs in <p> tags
+  - a strong opening paragraph
+  - 3 to 5 meaningful <h3> section headings
+  - detailed body paragraphs in <p> tags
+  - a thoughtful closing paragraph
 - Use <strong> only where emphasis is genuinely useful.
 - Return clean HTML only using: <h2>, <h3>, <p>, <ul>, <li>, <strong>.
 - Do not return markdown.

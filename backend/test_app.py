@@ -8,6 +8,7 @@ from app import (
     analyze_url_source,
     download_audio,
     extract_youtube_video_id,
+    fallback_article,
     fetch_youtube_transcript_text,
     find_http_urls_in_payload,
     is_youtube_url,
@@ -376,3 +377,18 @@ def test_generate_articles_endpoint_returns_articles(monkeypatch):
     payload = response.json()
     assert payload['success'] is True
     assert payload['result']['articles'][0]['content'] == 'Article for Topic A'
+
+
+def test_fallback_article_avoids_old_template_sections():
+    article = fallback_article(
+        'Headline Example',
+        '- First supporting point.\n- Second supporting point.\n- Third supporting point.\n- Fourth supporting point.',
+        'Example Topic',
+    )
+
+    assert '<h2>' in article
+    assert '<h3>' in article
+    assert 'Why This Topic Stands Out' not in article
+    assert 'Key Developments' not in article
+    assert 'What It Suggests' not in article
+    assert '**' not in article

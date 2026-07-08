@@ -123,6 +123,13 @@ COMMON_TOPIC_STOPWORDS = {
 }
 
 ALLOWED_ARTICLE_TAGS = {"h2", "h3", "p", "ul", "li", "strong", "br"}
+BANNED_ARTICLE_HEADINGS = {
+    "why this topic stands out",
+    "key developments",
+    "what it suggests",
+    "selected topic",
+    "source material",
+}
 
 
 def dependency_status() -> dict[str, bool | str]:
@@ -833,6 +840,74 @@ def sanitize_inline_html(text: str) -> str:
     return html.strip()
 
 
+def clean_topic_title(title: str) -> str:
+    cleaned = strip_html_tags(convert_asterisk_bold_to_html(title or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -,:;")
+    return cleaned[:90].strip() or "Main Topic"
+
+
+def build_editorial_topic_title(keyword: str, support_text: str, index: int) -> str:
+    support = " ".join((support_text or "").split())
+    keyword_title = keyword.strip().title() or "Main Topic"
+    if not support:
+        return keyword_title
+
+    support = re.sub(r"^[\"'(\[]+|[\"')\].,;:!?]+$", "", support)
+    if ":" in support:
+        prefix, suffix = support.split(":", 1)
+        candidate = suffix.strip() if len(suffix.split()) >= 3 else prefix.strip()
+        if candidate:
+            support = candidate
+
+    match = re.match(
+        r"^(?P<subject>[A-Z][A-Za-z0-9&' -]{2,40})\s+(?P<verb>is|are|was|were|has|have|can|will)\s+(?P<rest>.+)$",
+        support,
+    )
+    if match:
+        subject = match.group("subject").strip(" ,.;:-")
+        verb = match.group("verb").strip()
+        rest = match.group("rest").strip(" ,.;:-")
+        if subject.lower() not in {"the source", "the video", "the discussion", "the speaker", "the summary"}:
+            return clean_topic_title(f"How {subject} {verb} {rest}")
+
+    words = support.split()
+    if len(words) >= 5:
+        phrase = " ".join(words[:9]).strip(" ,.;:-")
+        lower_phrase = phrase.lower()
+        if keyword.lower() in lower_phrase and index > 2:
+            return clean_topic_title(phrase)
+        if index == 0:
+            return clean_topic_title(f"{keyword_title} and the Bigger Shift")
+        if index == 1:
+            return clean_topic_title(f"How {keyword_title} Shapes the Debate")
+        if index == 2:
+            return clean_topic_title(f"What {keyword_title} Reveals")
+        return clean_topic_title(f"{keyword_title}: {phrase}")
+
+    return clean_topic_title(keyword_title)
+
+
+def postprocess_article_html(raw_html: str) -> str:
+    html = sanitize_article_html(raw_html)
+    if not html:
+        return ""
+
+    html = re.sub(
+        r"<h3>\s*(Why This Topic Stands Out|Key Developments|What It Suggests|Selected Topic|Source Material)\s*</h3>",
+        "",
+        html,
+        flags=re.IGNORECASE,
+    )
+    html = re.sub(
+        r"<p>\s*(This article discusses|The source material says|The selected topic is|This article stays focused on)[^<]*</p>",
+        "",
+        html,
+        flags=re.IGNORECASE,
+    )
+    html = re.sub(r"\n{2,}", "\n", html).strip()
+    return html
+
+
 def fetch_youtube_subtitles_text(url: str, output_dir: str) -> str:
     yt_dlp = get_yt_dlp_module()
     output_dir_path = Path(output_dir)
@@ -1333,17 +1408,23 @@ def build_local_topic_details(summary_text: str) -> list[dict[str, str]]:
     support_pool = points or split_sentences(summary_text)
     for index, keyword in enumerate(keywords[:8]):
         support_text = support_pool[min(index, len(support_pool) - 1)] if support_pool else summary_text
+        title = build_editorial_topic_title(keyword, support_text, index)
+        importance_seed = support_pool[(index + 1) % len(support_pool)] if support_pool else support_text
         details.append(
             {
-                "title": keyword,
-                "explanation": sanitize_inline_html(support_text[:220].strip()),
-                "importance": sanitize_inline_html(f"This angle matters because it highlights how {keyword.lower()} shapes the broader message of the source material."),
+                "title": title,
+                "explanation": sanitize_inline_html(
+                    f"{support_text[:220].strip()} This angle gives the writer enough substance to build a full article instead of a thin summary."
+                ),
+                "importance": sanitize_inline_html(
+                    f"It matters because it opens a clearer view of the argument, the stakes, and the examples that give {keyword.lower()} real weight. {importance_seed[:140].strip()}"
+                ),
             }
         )
     return details or [{
-        "title": "Main Topic",
-        "explanation": sanitize_inline_html("The source centers on one main issue that can be expanded into a professional article."),
-        "importance": sanitize_inline_html("This topic is important because it captures the strongest idea presented in the source."),
+        "title": "The Main Argument Behind the Story",
+        "explanation": sanitize_inline_html("The source centers on one clearly expandable issue with enough direction, detail, and tension to support a professional article."),
+        "importance": sanitize_inline_html("It matters because it captures the strongest idea in the material and gives the writer a solid editorial angle to build on."),
     }]
 
 
@@ -1373,6 +1454,13 @@ Each topic must include:
 - explanation
 - importance
 
+Rules:
+- The title must sound like a real article angle, not a single-word label.
+- Avoid generic titles such as "News", "Update", "Main Topic", or "Overview".
+- Keep titles specific, useful, and directly connected to the summary.
+- Explanation must briefly say what the article would focus on.
+- Importance must explain why the angle deserves coverage.
+
 Return valid JSON only in this shape:
 [
   {{"title": "Topic title", "explanation": "Short explanation", "importance": "Why it matters"}},
@@ -1398,7 +1486,7 @@ Summary:
                 continue
             details.append(
                 {
-                    "title": strip_html_tags(convert_asterisk_bold_to_html(title)),
+                    "title": clean_topic_title(title),
                     "explanation": sanitize_inline_html(explanation),
                     "importance": sanitize_inline_html(importance),
                 }
@@ -1416,23 +1504,23 @@ def fallback_article(headline_text: str, summary_text: str, topic: Optional[str]
     support = body_points[1] if len(body_points) > 1 else lead
     detail = body_points[2] if len(body_points) > 2 else support
     closing_support = body_points[3] if len(body_points) > 3 else detail
-    return sanitize_article_html(
+    return postprocess_article_html(
         f"""
 <h2>{headline_text}</h2>
-<p>{lead} That opening point sets the tone for a larger discussion around <strong>{topic_title}</strong>, where speed, scale, and long-term ambition appear to converge in a way that reshapes how the wider story should be understood. Rather than standing alone as an isolated observation, it frames the subject as part of a broader shift with political, economic, or social weight.</p>
-<p>{support} Read together, these details suggest that the subject is not simply about one event or one talking point. It is about a pattern that has been building over time, gathering momentum through visible examples and practical outcomes. That gives the article room to move beyond surface description and into a more serious explanation of why the subject matters.</p>
-<h3>The Force Behind the Change</h3>
-<p>{detail} The most compelling aspect of <strong>{topic_title}</strong> is the way it connects visible results with a deeper system of planning, coordination, and intent. What stands out is not only what happened, but how quickly or decisively it happened, and what that says about the institutions, priorities, or pressures operating beneath the surface.</p>
-<p>That matters because readers rarely respond to raw facts alone. They respond to meaning. When a source presents a sequence of developments like this, the real task is to show how each example strengthens the central argument. In this case, the pattern points toward a subject that is larger than a single headline and more durable than a passing moment.</p>
-<h3>What the Examples Reveal</h3>
-<p>{lead} {support} These examples give the article substance. They show how the selected topic plays out in concrete terms, turning abstract discussion into something readers can picture and assess. That shift from claim to example is what gives the writing authority.</p>
-<p>{detail} {closing_support} Taken together, these details suggest a story shaped by visible transformation, discipline, and a willingness to think in terms of outcomes rather than slogans. The selected topic becomes more persuasive because it is supported by examples that feel grounded rather than decorative.</p>
-<h3>Why the Topic Carries Weight</h3>
-<p>The importance of <strong>{topic_title}</strong> lies in how it opens a wider conversation. It helps explain not just what changed, but why the change deserves attention now. Topics like this often matter because they reveal how power works, how priorities are set, or how societies attempt to move from ambition to execution.</p>
-<p>That is what gives the piece lasting value. A strong article does more than repeat highlights. It gives readers a coherent way to understand them. Here, the core material points toward a subject that rewards close attention because it sits at the intersection of visible change and the deeper structures that made that change possible.</p>
-<h3>The Broader Meaning</h3>
-<p>{closing_support} The final impression is not of a narrow issue, but of a subject with consequences that extend outward into public life, economic direction, and the language of progress itself. That is why <strong>{topic_title}</strong> works as a serious article subject: it contains both immediate interest and deeper analytical value.</p>
-<p>The strongest closing point is that the selected topic does not need artificial drama to feel significant. Its significance comes from the weight of the ideas attached to it and from the examples that give those ideas shape. A well-written article can build on that foundation naturally, leaving the reader with a sharper understanding of the issue and a clearer sense of why it deserves continued attention.</p>
+<p>{lead} That opening detail immediately gives <strong>{topic_title}</strong> a sense of consequence. It suggests a story that is not only timely, but layered enough to reward closer attention. The point is not simply that something happened. The point is that the development carries implications, and those implications become clearer once the surrounding examples are placed side by side.</p>
+<p>{support} Read together, the early signals create the outline of a bigger argument. They point toward a shift in priorities, a contest of ideas, or a change in public mood that deserves more than a passing mention. That is where the article gains its strength: it treats the subject as something substantial enough to explain, not merely something dramatic enough to repeat.</p>
+<h3>How the Story Builds Its Case</h3>
+<p>{detail} One of the most persuasive qualities of <strong>{topic_title}</strong> is the way the evidence accumulates. Each example adds pressure to the same central claim, making the story feel grounded rather than speculative. When readers can see how the argument is supported step by step, the writing becomes more convincing without having to overstate its point.</p>
+<p>{support} That structure matters. Strong editorial writing does not rely on noise. It relies on sequence, emphasis, and proportion. Here, the sequence gives the subject momentum, while the emphasis makes clear which ideas deserve the reader's attention first.</p>
+<h3>Why the Details Matter</h3>
+<p>{lead} {support} These details work because they turn an abstract theme into something tangible. They give the reader enough specificity to understand what is at stake, who is affected, and why the issue feels larger than a single moment. That is the difference between a thin recap and a serious article.</p>
+<p>{detail} {closing_support} Once these details are allowed to sit together, the topic begins to reveal its broader shape. It becomes easier to see the direction of the argument, the pressures behind it, and the reasons it may continue to matter long after the immediate event fades from view.</p>
+<h3>The Wider Significance</h3>
+<p><strong>{topic_title}</strong> carries weight because it opens into a larger conversation. It touches the logic behind decisions, the values guiding those decisions, and the public consequences that follow. Topics with that range rarely stay confined to one headline. They tend to echo across policy, culture, business, or civic life, depending on the material behind them.</p>
+<p>That is also what makes the article readable. Readers are not being handed disconnected talking points. They are being given a coherent interpretation of why the issue deserves sustained attention. The material holds together because the examples reinforce the same core direction instead of competing with one another.</p>
+<h3>Where the Argument Lands</h3>
+<p>{closing_support} By the end, the subject feels more fully formed. The strongest impression is not simply that the topic is relevant, but that it offers a useful way to understand a bigger pattern already taking shape. That makes it a stronger editorial subject than a one-dimensional trend piece or a narrow update.</p>
+<p>The article lands best when it leaves the reader with clarity rather than volume. That clarity comes from connecting examples to meaning, and from treating <strong>{topic_title}</strong> as a live issue with lasting significance. When the writing does that well, the subject no longer feels like raw source material. It feels like a finished argument.</p>
 """
     )
 
@@ -1530,7 +1618,8 @@ Instructions:
 - Do not write a topic brief, content plan, analysis note, or summary card.
 - Do not use headings such as "Why This Topic Stands Out", "Key Developments", "What It Suggests", or similar template labels.
 - Do not say "this article discusses", "the source material says", "the selected topic is", or any other meta-writing phrase.
-- Write at least 900 words unless brevity is absolutely necessary for factual accuracy.
+- Avoid phrases such as "In today's fast-paced world", "It is important to note", "In conclusion", "As we navigate", and "Unlocking the power of".
+- Write between 900 and 1200 words unless factual accuracy requires less.
 - Include:
   - one strong <h2> headline
   - a strong opening paragraph
@@ -1544,7 +1633,7 @@ Instructions:
 """
     try:
         article_text = gemini_generate_text(prompt)
-        return sanitize_article_html(article_text) or fallback_article(headline_text, summary_text, topic)
+        return postprocess_article_html(article_text) or fallback_article(headline_text, summary_text, topic)
     except Exception:
         return fallback_article(headline_text, summary_text, topic)
 

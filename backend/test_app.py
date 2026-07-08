@@ -11,6 +11,7 @@ from app import (
     fallback_article,
     fetch_youtube_transcript_text,
     find_http_urls_in_payload,
+    build_local_topic_details,
     is_youtube_url,
     select_any_non_youtube_url,
     select_apify_download_url,
@@ -86,6 +87,34 @@ def test_extract_youtube_video_id_supports_multiple_formats():
 def test_analyze_text_content_uses_fallback_summary_when_empty():
     result = analyze_text_content('', 'Summarize')
     assert 'Summarize' in result['headline']
+
+
+def test_build_local_topic_details_creates_editorial_titles():
+    summary = (
+        "- Saudi Arabia is accelerating large infrastructure projects at unusual speed.\n"
+        "- The discussion links execution, planning, and national ambition.\n"
+        "- Public messaging is tied to visible results and long-term economic change."
+    )
+    details = build_local_topic_details(summary)
+
+    assert details
+    assert len(details[0]["title"].split()) >= 2
+    assert "source material" not in details[0]["importance"].lower()
+
+
+def test_fallback_article_avoids_banned_meta_phrases():
+    html = fallback_article(
+        "How Ambition Is Reshaping a National Development Strategy",
+        "- The speaker highlights rapid project delivery.\n"
+        "- The summary connects visible construction with political intent.\n"
+        "- The material emphasizes long-term economic positioning.\n"
+        "- Public expectations are rising alongside the pace of change.",
+        topic="National Development Strategy",
+    )
+
+    assert "Why This Topic Stands Out" not in html
+    assert "the selected topic is" not in html.lower()
+    assert "this article discusses" not in html.lower()
 
 
 def test_fetch_youtube_transcript_text_uses_fetch_api(monkeypatch):

@@ -49,7 +49,6 @@ const appState = {
   },
   lastSubmission: null,
   selectedTopics: [],
-  activeJobId: '',
 };
 
 function escapeHtml(value) {
@@ -156,7 +155,6 @@ function resetGeneratorState() {
   appState.busyMessage = '';
   appState.selectedTopics = [];
   appState.lastSubmission = null;
-  appState.activeJobId = '';
 }
 
 function parseSummaryToList(summary) {
@@ -815,25 +813,6 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
   return payload;
 }
 
-async function pollAnalysisJob(jobId) {
-  for (;;) {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
-      headers: buildAuthHeaders(),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok && payload?.status !== 'failed') {
-      throw new Error(payload?.detail || payload?.error || 'Could not read job status.');
-    }
-    if (payload.status === 'completed') {
-      return payload.result;
-    }
-    if (payload.status === 'failed') {
-      throw new Error(payload.error || 'Background analysis failed.');
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 2500));
-  }
-}
-
 async function sendGenerateArticlesRequest({ headline, summary, topics, selectedTopics, articleCount }) {
   const response = await fetch('/api/articles', {
     method: 'POST',
@@ -893,29 +872,21 @@ async function handleAnalyzeSubmit(form) {
   appState.busyMessage = 'Analyzing your URL or uploaded video...';
   renderApp();
 
-  try {
-    const source = { url, query, file };
-    appState.lastSubmission = source;
-    const payload = await sendAnalyzeRequest({ generateArticle: false, selectedTopics: [], source });
-    let result = payload.result;
-    if (payload.queued && payload.job_id) {
-      appState.activeJobId = payload.job_id;
-      appState.busyMessage = 'Your URL is being processed in the background. We will load the analysis automatically...';
+    try {
+      const source = { url, query, file };
+      appState.lastSubmission = source;
+      const payload = await sendAnalyzeRequest({ generateArticle: false, selectedTopics: [], source });
+      const result = payload.result;
+      appState.analysisResult = result;
+      appState.selectedTopics = result.topics ? result.topics.slice(0, 3) : [];
+      appState.busyMode = '';
+      appState.busyMessage = '';
       renderApp();
-      result = await pollAnalysisJob(payload.job_id);
-    }
-    appState.analysisResult = result;
-    appState.selectedTopics = result.topics ? result.topics.slice(0, 3) : [];
-    appState.activeJobId = '';
-    appState.busyMode = '';
-    appState.busyMessage = '';
-    renderApp();
-  } catch (error) {
-    appState.analysisError = error.message;
-    appState.activeJobId = '';
-    appState.busyMode = '';
-    appState.busyMessage = '';
-    renderApp();
+    } catch (error) {
+      appState.analysisError = error.message;
+      appState.busyMode = '';
+      appState.busyMessage = '';
+      renderApp();
   }
 }
 

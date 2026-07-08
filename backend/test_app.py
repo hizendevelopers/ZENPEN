@@ -84,7 +84,7 @@ def test_extract_youtube_video_id_supports_multiple_formats():
 
 def test_analyze_text_content_uses_fallback_summary_when_empty():
     result = analyze_text_content('', 'Summarize')
-    assert result['headline'] == 'Key takeaways for: Summarize'
+    assert 'Summarize' in result['headline']
 
 
 def test_fetch_youtube_transcript_text_uses_fetch_api(monkeypatch):
@@ -253,7 +253,7 @@ def test_analyze_endpoint_falls_back_when_transcript_is_empty(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload['success'] is True
-    assert payload['result']['headline'] == 'Key takeaways for: Summarize'
+    assert 'Summarize' in payload['result']['headline']
     assert payload['result']['topics'] == ['Main topic']
 
 
@@ -304,12 +304,11 @@ def test_analyze_url_source_uses_subtitles_before_media_download(monkeypatch):
     assert result['articles'] == []
 
 
-def test_analyze_endpoint_queues_url_jobs_when_queue_is_available(monkeypatch):
-    class FakeJob:
-        id = 'job-123'
-
+def test_analyze_endpoint_stays_synchronous_even_if_queue_is_available(monkeypatch):
     monkeypatch.setattr('app.background_url_jobs_available', lambda: True)
-    monkeypatch.setattr('app.enqueue_url_analysis', lambda **kwargs: FakeJob())
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
 
     response = client.post(
         '/api/analyze',
@@ -319,8 +318,8 @@ def test_analyze_endpoint_queues_url_jobs_when_queue_is_available(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload['success'] is True
-    assert payload['queued'] is True
-    assert payload['job_id'] == 'job-123'
+    assert 'queued' not in payload
+    assert payload['result']['topics'] == ['Topic A']
 
 
 def test_job_status_endpoint_returns_completed_result(monkeypatch):

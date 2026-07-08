@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -66,6 +67,7 @@ FAST_ANALYSIS_MODE = os.getenv("FAST_ANALYSIS_MODE", "true").strip().lower() not
 FAST_ANALYSIS_TRANSCRIPT_LIMIT = int(os.getenv("FAST_ANALYSIS_TRANSCRIPT_LIMIT", "5000"))
 FAST_ANALYSIS_CHUNK_LIMIT = int(os.getenv("FAST_ANALYSIS_CHUNK_LIMIT", "6"))
 ENABLE_BACKGROUND_URL_JOBS = os.getenv("ENABLE_BACKGROUND_URL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
+GEMINI_BACKOFF_UNTIL = 0.0
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -108,6 +110,17 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+COMMON_TOPIC_STOPWORDS = {
+    "about", "after", "again", "also", "amid", "among", "around", "being", "below", "between",
+    "both", "could", "first", "from", "further", "here", "into", "just", "main", "more", "most",
+    "news", "only", "other", "over", "same", "some", "such", "than", "that", "their", "there",
+    "these", "they", "this", "those", "through", "under", "using", "very", "what", "when", "where",
+    "which", "while", "with", "would", "your", "have", "were", "been", "them", "because", "content",
+    "video", "transcript", "summary", "give", "breaking", "points", "said", "says", "show", "kind",
+    "then", "taken", "single", "generation", "musical", "story", "system",
+}
 
 
 def dependency_status() -> dict[str, bool | str]:
@@ -238,7 +251,7 @@ def get_api_config() -> dict[str, object]:
             "publishableKey": SUPABASE_PUBLISHABLE_KEY or None,
         },
         "queue": {
-            "enabled": ENABLE_BACKGROUND_URL_JOBS and queue_is_available(),
+            "enabled": False,
         },
     }
 
@@ -583,6 +596,36 @@ def get_genai_client():
         genai = get_genai_module()
         GENAI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
     return GENAI_CLIENT
+
+
+def parse_retry_delay_seconds(message: str) -> int:
+    match = re.search(r"retry in\s+(\d+)", message, re.IGNORECASE)
+    if match:
+        return max(int(match.group(1)), 30)
+    return 60
+
+
+def should_skip_gemini() -> bool:
+    return GEMINI_BACKOFF_UNTIL > time.time()
+
+
+def gemini_generate_text(prompt: str) -> str:
+    global GEMINI_BACKOFF_UNTIL
+    if should_skip_gemini():
+        raise RuntimeError("Gemini is temporarily cooling down after a quota/rate-limit response.")
+
+    client = get_genai_client()
+    try:
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=prompt,
+        )
+        return getattr(response, "text", "").strip()
+    except Exception as exc:
+        error_text = str(exc)
+        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text or "rate limit" in error_text.lower():
+            GEMINI_BACKOFF_UNTIL = time.time() + parse_retry_delay_seconds(error_text)
+        raise
 
 
 def load_history() -> list[dict]:
@@ -1171,39 +1214,93 @@ def retrieve_context(query: str, chunks: list[str], index, k: int = 3) -> str:
     return "\n".join([chunks[i] for i in indices[0]])
 
 
+def split_sentences(text: str) -> list[str]:
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return []
+    try:
+        return [sentence.strip() for sentence in sent_tokenize(normalized) if sentence.strip()]
+    except LookupError:
+        return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", normalized) if sentence.strip()]
+
+
+def extract_top_keywords(text: str, limit: int = 5) -> list[str]:
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9'-]{3,}", text or "")
+    counts = Counter(token.lower() for token in tokens if token.lower() not in COMMON_TOPIC_STOPWORDS)
+    keywords: list[str] = []
+    for word, _ in counts.most_common(limit * 3):
+        cleaned = word.strip("-'")
+        if not cleaned or cleaned in keywords:
+            continue
+        keywords.append(cleaned.title())
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+def build_local_headline(query: str, transcript: str) -> str:
+    points = build_local_summary_points(transcript, max_points=3)
+    if len(points) > 1 and len(points[0].split()) < 10:
+        points = points[1:]
+    keywords = extract_top_keywords(" ".join(points), limit=3)
+    if keywords:
+        return f"{' | '.join(keywords)}: {query}".replace("Give ", "").strip()
+    return f"Key Takeaways: {query}".strip()
+
+
+def build_local_summary_points(transcript: str, max_points: int = 4) -> list[str]:
+    sentences = split_sentences(transcript)
+    if not sentences:
+        return ["No transcript could be extracted from the provided source."]
+
+    selected: list[str] = []
+    for sentence in sentences:
+        compact = " ".join(sentence.split())
+        if len(compact) < 40:
+            continue
+        if compact in selected:
+            continue
+        selected.append(compact)
+        if len(selected) >= max_points:
+            break
+
+    if not selected:
+        selected = sentences[:max_points]
+    return selected[:max_points]
+
+
 def fallback_summary(transcript: str, query: str) -> dict[str, str]:
-    cleaned = " ".join(transcript.split())
-    first_sentence = cleaned[:220].strip() if cleaned else "No transcript available."
+    points = build_local_summary_points(transcript)
     return {
-        "headline": f"Key takeaways for: {query}",
-        "summary": "\n".join([
-            "- Main topic identified from the transcript.",
-            f"- The speech content begins with: {first_sentence}",
-            "- The system can expand this summary further when Gemini access is available.",
-        ]),
+        "headline": build_local_headline(query, transcript),
+        "summary": "\n".join(f"- {point}" for point in points),
     }
 
 
 def fallback_topics(summary_text: str) -> list[str]:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]{3,}", summary_text)
-    seen: list[str] = []
-    for word in words:
-        normalized = word.lower()
-        if normalized not in {item.lower() for item in seen}:
-            seen.append(word)
-        if len(seen) == 5:
-            break
-    return seen or ["Main topic"]
+    points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")]
+    if len(points) > 1 and len(points[0].split()) < 10:
+        points = points[1:]
+    topic_source = " ".join(points) if points else summary_text
+    return extract_top_keywords(topic_source, limit=5) or ["Main Topic"]
 
 
 def fallback_article(headline_text: str, summary_text: str, topic: Optional[str] = None) -> str:
-    focus = f" with a focus on {topic}" if topic else ""
-    summary_points = [line[2:] for line in summary_text.splitlines() if line.startswith("- ")]
-    body = " ".join(summary_points) or summary_text or "No summary details were available."
+    topic_title = topic or "Main Topic"
+    summary_points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")]
+    body_points = summary_points or ["No summary details were available from the source."]
+    lead = body_points[0]
+    support = " ".join(body_points[1:3]) if len(body_points) > 1 else lead
+    detail_block = " ".join(body_points)
     return (
-        f"{headline_text}{focus}\n\n"
-        f"This generated article expands on the analysis in a readable news style. {body} "
-        "The story highlights the central development, explains why it matters, and notes that more detail can be produced when Gemini is configured."
+        f"{headline_text}\n\n"
+        f"{lead} This article focuses on {topic_title.lower()} and expands the core developments in a clear, publication-ready style.\n\n"
+        f"Why this matters\n"
+        f"{support} The developments described in the source indicate why this topic deserves attention and how it fits into the wider story.\n\n"
+        f"Key details\n"
+        f"{detail_block} Taken together, these points provide the practical context a reader needs without losing the speed of a newsroom-style summary.\n\n"
+        f"Outlook\n"
+        f"The current signals around {topic_title.lower()} suggest the story is still developing. Editors or publishers can use this draft as a strong starting point and refine it further with additional reporting or source material."
     )
 
 
@@ -1231,7 +1328,6 @@ def build_article_image_url(topic: Optional[str]) -> str:
 
 
 def gemini_rag(context: str, query: str) -> dict[str, str]:
-    client = get_genai_client()
     prompt = f"""
 You are an intelligent news and content analysis AI.
 Context from media:
@@ -1249,11 +1345,7 @@ Summary:
 - point 2
 - point 3
 """
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        contents=prompt,
-    )
-    response_text = getattr(response, "text", "")
+    response_text = gemini_generate_text(prompt)
 
     headline_text = ""
     summary_lines = []
@@ -1287,30 +1379,23 @@ Headline:
 Summary:
 {summary_text}
 
-Instructions:
-- Write roughly 220 to 320 words.
-- Use a journalistic tone.
-- Start directly with the article.
-- Include context, implications, and balanced perspective.
-- Keep it readable and human.
-- {topic_instruction}
+    Instructions:
+    - Write roughly 220 to 320 words.
+    - Use a journalistic tone.
+    - Start directly with the article.
+    - Use a strong headline, clear sections, and readable transitions.
+    - Include context, implications, and balanced perspective.
+    - Keep it readable and human.
+    - {topic_instruction}
 """
     try:
-        client = get_genai_client()
-        response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            contents=prompt,
-        )
-        article_text = getattr(response, "text", "").strip()
+        article_text = gemini_generate_text(prompt)
         return article_text or fallback_article(headline_text, summary_text, topic)
     except Exception:
         return fallback_article(headline_text, summary_text, topic)
 
 
 def get_topics_from_summary(summary_text: str) -> list[str]:
-    if FAST_ANALYSIS_MODE:
-        return fallback_topics(summary_text)
-
     prompt = f"""Extract 3 to 5 distinct key topics from the summary below.
 Return only a comma-separated list with no extra commentary.
 
@@ -1318,12 +1403,7 @@ Summary:
 {summary_text}
 """
     try:
-        client = get_genai_client()
-        response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            contents=prompt,
-        )
-        raw_topics = getattr(response, "text", "")
+        raw_topics = gemini_generate_text(prompt)
         topics = [topic.strip(" -\n\r\t") for topic in raw_topics.split(",") if topic.strip()]
         return topics[:5] or fallback_topics(summary_text)
     except Exception:
@@ -1593,22 +1673,6 @@ async def analyze_endpoint(
 
     try:
         user = resolve_supabase_user(request)
-        if url and not file and background_url_jobs_available():
-            job = enqueue_url_analysis(
-                url=url,
-                query=query or "Summarize the content",
-                user_id=str(user["id"]) if user else None,
-            )
-            return JSONResponse(
-                {
-                    "success": True,
-                    "queued": True,
-                    "job_id": job.id,
-                    "status": "queued",
-                    "poll_url": f"/api/jobs/{job.id}",
-                }
-            )
-
         with tempfile.TemporaryDirectory(prefix="media-analyzer-") as temp_dir:
             temp_dir_path = Path(temp_dir)
             temp_audio_path: Optional[str] = None

@@ -119,8 +119,10 @@ COMMON_TOPIC_STOPWORDS = {
     "these", "they", "this", "those", "through", "under", "using", "very", "what", "when", "where",
     "which", "while", "with", "would", "your", "have", "were", "been", "them", "because", "content",
     "video", "transcript", "summary", "give", "breaking", "points", "said", "says", "show", "kind",
-    "then", "taken", "single", "generation", "musical", "story", "system",
+    "then", "taken", "single", "generation", "musical", "story", "system", "shown", "last", "this", "that",
 }
+
+ALLOWED_ARTICLE_TAGS = {"h2", "h3", "p", "ul", "li", "strong", "br"}
 
 
 def dependency_status() -> dict[str, bool | str]:
@@ -779,6 +781,58 @@ def clean_vtt_caption_text(raw_text: str) -> str:
     return " ".join(cleaned_lines).strip()
 
 
+def convert_asterisk_bold_to_html(text: str) -> str:
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text or "")
+
+
+def strip_html_tags(text: str) -> str:
+    no_tags = re.sub(r"<[^>]+>", " ", text or "")
+    return " ".join(no_tags.split()).strip()
+
+
+def sanitize_article_html(raw_html: str) -> str:
+    if not raw_html.strip():
+        return ""
+
+    html = convert_asterisk_bold_to_html(raw_html.strip())
+    html = re.sub(r"(?m)^\s*#{3}\s*(.+)$", r"<h3>\1</h3>", html)
+    html = re.sub(r"(?m)^\s*#{2}\s*(.+)$", r"<h2>\1</h2>", html)
+
+    if not re.search(r"<(?:h2|h3|p|ul|li)\b", html):
+        blocks: list[str] = []
+        paragraphs = [block.strip() for block in re.split(r"\n\s*\n", html) if block.strip()]
+        for index, paragraph in enumerate(paragraphs):
+            cleaned = paragraph.strip()
+            if cleaned.startswith("- "):
+                items = [item.strip()[2:].strip() for item in cleaned.splitlines() if item.strip().startswith("- ")]
+                blocks.append("<ul>" + "".join(f"<li>{item}</li>" for item in items if item) + "</ul>")
+            elif index == 0:
+                blocks.append(f"<h2>{cleaned}</h2>")
+            else:
+                blocks.append(f"<p>{cleaned}</p>")
+        html = "\n".join(blocks)
+
+    html = re.sub(r"\n{2,}", "\n", html)
+    html = re.sub(r"</?(script|style)[^>]*>", "", html, flags=re.IGNORECASE)
+    html = re.sub(
+        r"</?([a-zA-Z0-9]+)(?:\s+[^>]*)?>",
+        lambda match: match.group(0) if match.group(1).lower() in ALLOWED_ARTICLE_TAGS else "",
+        html,
+    )
+    return html.strip()
+
+
+def sanitize_inline_html(text: str) -> str:
+    html = convert_asterisk_bold_to_html(text or "")
+    html = re.sub(r"</?(script|style)[^>]*>", "", html, flags=re.IGNORECASE)
+    html = re.sub(
+        r"</?([a-zA-Z0-9]+)(?:\s+[^>]*)?>",
+        lambda match: match.group(0) if match.group(1).lower() == "strong" else "",
+        html,
+    )
+    return html.strip()
+
+
 def fetch_youtube_subtitles_text(url: str, output_dir: str) -> str:
     yt_dlp = get_yt_dlp_module()
     output_dir_path = Path(output_dir)
@@ -1269,6 +1323,30 @@ def build_local_summary_points(transcript: str, max_points: int = 4) -> list[str
     return selected[:max_points]
 
 
+def build_local_topic_details(summary_text: str) -> list[dict[str, str]]:
+    points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")]
+    if len(points) > 1 and len(points[0].split()) < 10:
+        points = points[1:]
+    topic_source = " ".join(points) if points else summary_text
+    keywords = extract_top_keywords(topic_source, limit=8)
+    details: list[dict[str, str]] = []
+    support_pool = points or split_sentences(summary_text)
+    for index, keyword in enumerate(keywords[:8]):
+        support_text = support_pool[min(index, len(support_pool) - 1)] if support_pool else summary_text
+        details.append(
+            {
+                "title": keyword,
+                "explanation": sanitize_inline_html(support_text[:220].strip()),
+                "importance": sanitize_inline_html(f"This angle matters because it highlights how {keyword.lower()} shapes the broader message of the source material."),
+            }
+        )
+    return details or [{
+        "title": "Main Topic",
+        "explanation": sanitize_inline_html("The source centers on one main issue that can be expanded into a professional article."),
+        "importance": sanitize_inline_html("This topic is important because it captures the strongest idea presented in the source."),
+    }]
+
+
 def fallback_summary(transcript: str, query: str) -> dict[str, str]:
     points = build_local_summary_points(transcript)
     return {
@@ -1285,6 +1363,51 @@ def fallback_topics(summary_text: str) -> list[str]:
     return extract_top_keywords(topic_source, limit=5) or ["Main Topic"]
 
 
+def get_topic_details_from_summary(summary_text: str) -> list[dict[str, str]]:
+    prompt = f"""
+You are analyzing a video summary for an article generation tool.
+
+Create 5 to 8 article topic options based strictly on the summary below.
+Each topic must include:
+- title
+- explanation
+- importance
+
+Return valid JSON only in this shape:
+[
+  {{"title": "Topic title", "explanation": "Short explanation", "importance": "Why it matters"}},
+  {{"title": "Topic title", "explanation": "Short explanation", "importance": "Why it matters"}}
+]
+
+Summary:
+{summary_text}
+"""
+    try:
+        raw_text = gemini_generate_text(prompt)
+        payload = json.loads(raw_text)
+        if not isinstance(payload, list):
+            raise ValueError("Topic details payload must be a list.")
+        details: list[dict[str, str]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            explanation = str(item.get("explanation", "")).strip()
+            importance = str(item.get("importance", "")).strip()
+            if not title:
+                continue
+            details.append(
+                {
+                    "title": strip_html_tags(convert_asterisk_bold_to_html(title)),
+                    "explanation": sanitize_inline_html(explanation),
+                    "importance": sanitize_inline_html(importance),
+                }
+            )
+        return details[:8] or build_local_topic_details(summary_text)
+    except Exception:
+        return build_local_topic_details(summary_text)
+
+
 def fallback_article(headline_text: str, summary_text: str, topic: Optional[str] = None) -> str:
     topic_title = topic or "Main Topic"
     summary_points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")]
@@ -1292,15 +1415,17 @@ def fallback_article(headline_text: str, summary_text: str, topic: Optional[str]
     lead = body_points[0]
     support = " ".join(body_points[1:3]) if len(body_points) > 1 else lead
     detail_block = " ".join(body_points)
-    return (
-        f"{headline_text}\n\n"
-        f"{lead} This article focuses on {topic_title.lower()} and expands the core developments in a clear, publication-ready style.\n\n"
-        f"Why this matters\n"
-        f"{support} The developments described in the source indicate why this topic deserves attention and how it fits into the wider story.\n\n"
-        f"Key details\n"
-        f"{detail_block} Taken together, these points provide the practical context a reader needs without losing the speed of a newsroom-style summary.\n\n"
-        f"Outlook\n"
-        f"The current signals around {topic_title.lower()} suggest the story is still developing. Editors or publishers can use this draft as a strong starting point and refine it further with additional reporting or source material."
+    return sanitize_article_html(
+        f"""
+<h2>{headline_text}</h2>
+<p>{lead} This article stays focused on <strong>{topic_title}</strong> and builds directly from the ideas presented in the source material.</p>
+<h3>Why This Topic Stands Out</h3>
+<p>{support} The source treats this angle as central to the wider discussion, making it a strong basis for a professional article.</p>
+<h3>Key Developments</h3>
+<p>{detail_block} Together, these details create a clear narrative that can be understood quickly without losing depth.</p>
+<h3>What It Suggests</h3>
+<p>The discussion around <strong>{topic_title}</strong> points to a larger trend or consequence that deserves continued attention as the story develops.</p>
+"""
     )
 
 
@@ -1329,21 +1454,30 @@ def build_article_image_url(topic: Optional[str]) -> str:
 
 def gemini_rag(context: str, query: str) -> dict[str, str]:
     prompt = f"""
-You are an intelligent news and content analysis AI.
+You are an expert video analyst and content strategist.
+
+Study the source context carefully and extract only the article-worthy ideas that are actually present in it.
+
 Context from media:
 {context}
+
 User Query:
 {query}
+
 Instructions:
-- Provide a catchy headline on one line.
-- Then provide a concise summary in bullet points.
-- Keep it engaging and readable.
+- Create a strong, specific title for the source.
+- Then write a concise and meaningful summary in 4 bullet points.
+- Keep the wording natural, professional, and grounded in the source.
+- Do not invent facts that are not supported by the source.
+- If the source compares countries, systems, history, politics, economics, or culture, preserve that framing accurately.
+
 Format strictly as:
 Headline: <headline>
 Summary:
 - point 1
 - point 2
 - point 3
+- point 4
 """
     response_text = gemini_generate_text(prompt)
 
@@ -1357,7 +1491,7 @@ Summary:
         elif line.startswith("Summary:"):
             current_section = "summary"
         elif current_section == "summary" and line.strip():
-            summary_lines.append(line.strip())
+            summary_lines.append(sanitize_inline_html(line.strip()))
 
     return {
         "headline": headline_text or "Media summary",
@@ -1371,7 +1505,7 @@ def generate_news_article(headline_text: str, summary_text: str, topic: Optional
 
     topic_instruction = f"Focus specifically on the topic '{topic}'." if topic else "Use the overall summary as the focus."
     prompt = f"""
-You are a professional journalist writing a clear and engaging news article.
+You are an experienced editorial writer, video analyst, and professional article writer.
 
 Headline:
 {headline_text}
@@ -1379,45 +1513,43 @@ Headline:
 Summary:
 {summary_text}
 
-    Instructions:
-    - Write roughly 220 to 320 words.
-    - Use a journalistic tone.
-    - Start directly with the article.
-    - Use a strong headline, clear sections, and readable transitions.
-    - Include context, implications, and balanced perspective.
-    - Keep it readable and human.
-    - {topic_instruction}
+Instructions:
+- Write a complete article only on the selected topic.
+- Base the article strictly on the source material summarized above.
+- Do not invent facts, quotes, names, or unsupported claims.
+- Write in a natural, human, professional editorial style.
+- Avoid robotic filler phrases and generic transitions.
+- Include:
+  - one strong <h2> headline
+  - a short opening paragraph
+  - 2 to 4 meaningful <h3> section headings
+  - body paragraphs in <p> tags
+- Use <strong> only where emphasis is genuinely useful.
+- Return clean HTML only using: <h2>, <h3>, <p>, <ul>, <li>, <strong>.
+- Do not return markdown.
+- {topic_instruction}
 """
     try:
         article_text = gemini_generate_text(prompt)
-        return article_text or fallback_article(headline_text, summary_text, topic)
+        return sanitize_article_html(article_text) or fallback_article(headline_text, summary_text, topic)
     except Exception:
         return fallback_article(headline_text, summary_text, topic)
 
 
 def get_topics_from_summary(summary_text: str) -> list[str]:
-    prompt = f"""Extract 3 to 5 distinct key topics from the summary below.
-Return only a comma-separated list with no extra commentary.
-
-Summary:
-{summary_text}
-"""
-    try:
-        raw_topics = gemini_generate_text(prompt)
-        topics = [topic.strip(" -\n\r\t") for topic in raw_topics.split(",") if topic.strip()]
-        return topics[:5] or fallback_topics(summary_text)
-    except Exception:
-        return fallback_topics(summary_text)
+    return [item["title"] for item in get_topic_details_from_summary(summary_text)]
 
 
 def enrich_analysis(result: dict[str, str], generate_article: bool = False, selected_topics: Optional[list[str]] = None, article_count: int = 1) -> dict[str, object]:
     headline = result.get("headline", "Media summary")
     summary = result.get("summary", "")
-    topics = get_topics_from_summary(summary)
+    topic_details = get_topic_details_from_summary(summary)
+    topics = [item["title"] for item in topic_details]
     payload: dict[str, object] = {
         "headline": headline,
         "summary": summary,
         "topics": topics,
+        "topic_details": topic_details,
         "articles": [],
     }
 

@@ -1045,15 +1045,52 @@ input:focus {
 }
 
 .topic-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.55rem;
-  cursor: pointer;
+  display: grid;
+  position: relative;
+  align-items: start;
+  justify-items: start;
+  gap: 0.45rem;
+  min-width: min(100%, 260px);
+  padding: 0.9rem 1rem;
+  border-radius: 18px;
+  border: 1px solid rgba(31, 96, 58, 0.08);
+  background: rgba(255, 255, 255, 0.8);
 }
 
 .topic-option input {
   width: 1rem;
   height: 1rem;
+  margin-top: 0.18rem;
+}
+
+.topic-option-copy,
+.topic-option-note {
+  color: var(--muted);
+  line-height: 1.65;
+  font-size: 0.95rem;
+}
+
+.topic-option-note strong,
+.topic-option-copy strong {
+  color: var(--text-strong);
+}
+
+.topic-option .topic-pill {
+  margin-left: 1.55rem;
+}
+
+.topic-option-copy,
+.topic-option-note {
+  margin-left: 1.55rem;
+}
+
+.topic-option > input {
+  position: absolute;
+}
+
+.topic-form {
+  display: grid;
+  gap: 0.55rem;
 }
 
 .topic-pill,
@@ -1108,6 +1145,34 @@ input:focus {
 .article-content {
   color: var(--muted);
   line-height: 1.8;
+}
+
+.article-content h2,
+.article-content h3 {
+  color: var(--text-strong);
+  margin: 0 0 0.8rem;
+}
+
+.article-content h2 {
+  font-size: 1.45rem;
+}
+
+.article-content h3 {
+  font-size: 1.05rem;
+  margin-top: 1.2rem;
+}
+
+.article-content p,
+.article-content ul {
+  margin: 0 0 0.95rem;
+}
+
+.article-content ul {
+  padding-left: 1.2rem;
+}
+
+.article-content strong {
+  color: var(--text-strong);
 }
 
 .or-divider {

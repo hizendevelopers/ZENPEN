@@ -165,6 +165,12 @@ function parseSummaryToList(summary) {
     .map((line) => line.replace(/^-+\s*/, ''));
 }
 
+function stripHtmlToText(html) {
+  const temp = document.createElement('div');
+  temp.innerHTML = String(html || '');
+  return temp.textContent || temp.innerText || '';
+}
+
 function buildHeader() {
   const session = getSession();
   const authActions = session
@@ -575,14 +581,14 @@ function buildAnalysisSummary() {
     <div class="analysis-result-card">
       <span class="eyebrow">Analysis Output</span>
       <h2>${escapeHtml(result.headline)}</h2>
-      <div class="summary-block">
-        <h3>Summary</h3>
-        <ul>
-          ${summaryItems.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
-        </ul>
+        <div class="summary-block">
+          <h3>Summary</h3>
+          <ul>
+            ${summaryItems.map((item) => `<li>${item}</li>`).join('')}
+          </ul>
+        </div>
       </div>
-    </div>
-  `;
+    `;
 }
 
 function buildTopicSelector() {
@@ -590,11 +596,16 @@ function buildTopicSelector() {
     return '';
   }
   const topics = appState.analysisResult.topics;
+  const topicDetails = appState.analysisResult.topic_details || topics.map((topic) => ({
+    title: topic,
+    explanation: '',
+    importance: '',
+  }));
   const selectedSet = new Set(appState.selectedTopics.length ? appState.selectedTopics : topics.slice(0, 3));
   const articleState = appState.busyMode === 'articles'
     ? `<div class="state-banner loading-state inline-state"><div class="loader small-loader"></div><span>${escapeHtml(appState.busyMessage)}</span></div>`
     : appState.articleError
-      ? `<div class="state-banner error-state">${escapeHtml(appState.articleError)}</div>`
+        ? `<div class="state-banner error-state">${escapeHtml(appState.articleError)}</div>`
       : '';
 
   return `
@@ -603,15 +614,17 @@ function buildTopicSelector() {
         <span class="eyebrow">Detected Topics</span>
         <h3>Select topics for article generation</h3>
       </div>
-      <form id="topic-selection-form" class="topic-form">
-        <div class="topic-selector-list">
-          ${topics.map((topic) => `
-            <label class="topic-option">
-              <input type="checkbox" name="selected-topic" value="${escapeHtml(topic)}" ${selectedSet.has(topic) ? 'checked' : ''} />
-              <span class="topic-pill">${escapeHtml(topic)}</span>
-            </label>
-          `).join('')}
-        </div>
+        <form id="topic-selection-form" class="topic-form">
+          <div class="topic-selector-list">
+            ${topicDetails.map((topic) => `
+              <label class="topic-option">
+                <input type="checkbox" name="selected-topic" value="${escapeHtml(topic.title)}" ${selectedSet.has(topic.title) ? 'checked' : ''} />
+                <span class="topic-pill">${escapeHtml(topic.title)}</span>
+                ${topic.explanation ? `<span class="topic-option-copy">${topic.explanation}</span>` : ''}
+                ${topic.importance ? `<span class="topic-option-note">${topic.importance}</span>` : ''}
+              </label>
+            `).join('')}
+          </div>
         <div class="topic-actions">
           <label>
             Articles per topic
@@ -649,22 +662,22 @@ function buildArticlesSection() {
             <div class="article-image-wrap">
               <img src="${escapeHtml(article.image_url || '')}" alt="${escapeHtml(article.topic)} article image" />
             </div>
-            <div class="article-output-body">
-              <div class="article-card-header">
-                <div>
-                  <span class="topic-tag">${escapeHtml(article.topic)}</span>
-                  <h4>${escapeHtml(appState.analysisResult.headline)}</h4>
-                </div>
+              <div class="article-output-body">
+                <div class="article-card-header">
+                  <div>
+                    <span class="topic-tag">${escapeHtml(article.topic)}</span>
+                    <h4>${escapeHtml(appState.analysisResult.headline)}</h4>
+                  </div>
                 <div class="article-actions">
                   <button class="secondary-btn" data-action="copy-article" data-article-index="${index}">Copy</button>
                   <button class="secondary-btn" data-action="download-article" data-article-index="${index}">Download</button>
                 </div>
               </div>
-              <div class="article-content">${escapeHtml(article.content).replace(/\n/g, '<br />')}</div>
-            </div>
-          </article>
-        `).join('')}
-      </div>
+                <div class="article-content">${article.content || ''}</div>
+              </div>
+            </article>
+          `).join('')}
+        </div>
     </section>
   `;
 }
@@ -1021,7 +1034,7 @@ function downloadTextFile(filename, content) {
 }
 
 async function copyArticle(article, index) {
-  const text = `Article ${index + 1}: ${article.topic}\n\n${article.content}`;
+  const text = `Article ${index + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`;
   await navigator.clipboard.writeText(text);
 }
 
@@ -1056,14 +1069,14 @@ function attachDelegatedHandlers() {
       return;
     }
 
-    if (button.dataset.action === 'download-all-articles') {
-      const articles = appState.analysisResult?.articles || [];
-      const payload = articles
-        .map((article, index) => `Article ${index + 1}: ${article.topic}\n\n${article.content}`)
-        .join('\n\n' + '-'.repeat(80) + '\n\n');
-      downloadTextFile('generated-articles.txt', payload);
-      return;
-    }
+      if (button.dataset.action === 'download-all-articles') {
+        const articles = appState.analysisResult?.articles || [];
+        const payload = articles
+          .map((article, index) => `Article ${index + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`)
+          .join('\n\n' + '-'.repeat(80) + '\n\n');
+        downloadTextFile('generated-articles.txt', payload);
+        return;
+      }
 
     if (button.dataset.action === 'copy-article') {
       const articleIndex = Number(button.dataset.articleIndex);
@@ -1073,13 +1086,13 @@ function attachDelegatedHandlers() {
       return;
     }
 
-    if (button.dataset.action === 'download-article') {
-      const articleIndex = Number(button.dataset.articleIndex);
-      const article = appState.analysisResult?.articles?.[articleIndex];
-      if (!article) return;
-      const safeTopic = article.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `article-${articleIndex + 1}`;
-      downloadTextFile(`${safeTopic}.txt`, `Article ${articleIndex + 1}: ${article.topic}\n\n${article.content}`);
-    }
+      if (button.dataset.action === 'download-article') {
+        const articleIndex = Number(button.dataset.articleIndex);
+        const article = appState.analysisResult?.articles?.[articleIndex];
+        if (!article) return;
+        const safeTopic = article.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `article-${articleIndex + 1}`;
+        downloadTextFile(`${safeTopic}.txt`, `Article ${articleIndex + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`);
+      }
   });
 }
 

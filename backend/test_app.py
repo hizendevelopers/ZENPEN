@@ -117,7 +117,9 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('download failed')))
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript from YouTube captions.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
+    ])
 
     response = client.post(
         '/api/analyze',
@@ -136,7 +138,9 @@ def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
+    ])
 
     response = client.post(
         '/api/analyze',
@@ -222,7 +226,10 @@ def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
     monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A', 'Topic B'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'},
+        {'title': 'Topic B', 'explanation': 'Explanation B', 'importance': 'Importance B'},
+    ])
 
     response = client.post(
         '/api/analyze',
@@ -236,13 +243,16 @@ def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
     assert 'headline' in payload['result']
     assert 'summary' in payload['result']
     assert payload['result']['topics'] == ['Topic A', 'Topic B']
+    assert payload['result']['topic_details'][0]['title'] == 'Topic A'
     assert payload['result']['articles'] == []
 
 
 def test_analyze_endpoint_falls_back_when_transcript_is_empty(monkeypatch):
     monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: '')
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Main topic'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Main topic', 'explanation': 'Explanation', 'importance': 'Importance'}
+    ])
 
     response = client.post(
         '/api/analyze',
@@ -261,7 +271,9 @@ def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
     monkeypatch.setattr('app.queue_is_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
+    ])
     monkeypatch.setattr('app.generate_news_article', lambda headline, summary, topic=None: f'Article for {topic}')
 
     response = client.post(
@@ -283,7 +295,10 @@ def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A', 'Topic B'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'},
+        {'title': 'Topic B', 'explanation': 'Explanation B', 'importance': 'Importance B'},
+    ])
 
     result = analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
 
@@ -296,7 +311,9 @@ def test_analyze_url_source_uses_subtitles_before_media_download(monkeypatch):
     monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: 'Subtitle transcript available immediately.')
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
+    ])
 
     result = analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
 
@@ -308,7 +325,9 @@ def test_analyze_endpoint_stays_synchronous_even_if_queue_is_available(monkeypat
     monkeypatch.setattr('app.background_url_jobs_available', lambda: True)
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topics_from_summary', lambda summary: ['Topic A'])
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
+    ])
 
     response = client.post(
         '/api/analyze',

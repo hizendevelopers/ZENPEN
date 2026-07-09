@@ -206,6 +206,7 @@ def dependency_status() -> dict[str, bool | str]:
         "redis_queue_available": queue_is_available(),
         "background_url_jobs_enabled": ENABLE_BACKGROUND_URL_JOBS,
         "remote_media_download_fallback_enabled": ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
+        "remote_media_fallback_available": remote_media_fallback_available(),
         "youtube_proxy_configured": bool(get_proxy_url("http") or get_proxy_url("https")),
     }
 
@@ -703,6 +704,10 @@ def get_proxy_url(scheme: str = "https") -> Optional[str]:
     if scheme == "https":
         return YOUTUBE_PROXY_HTTPS or YOUTUBE_PROXY_URL or YOUTUBE_PROXY_HTTP or None
     return YOUTUBE_PROXY_HTTP or YOUTUBE_PROXY_URL or YOUTUBE_PROXY_HTTPS or None
+
+
+def remote_media_fallback_available() -> bool:
+    return ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK or bool(APIFY_TOKEN or get_proxy_url("http") or get_proxy_url("https"))
 
 
 def ensure_ffmpeg() -> None:
@@ -2381,7 +2386,7 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
                 try:
                     transcript_override = fetch_youtube_subtitles_text(url, temp_dir)
                 except Exception as subtitle_exc:
-                    if not ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK:
+                    if not remote_media_fallback_available():
                         raise RuntimeError(
                             "This YouTube video could not provide transcript or subtitle text quickly enough. "
                             "Please try another video or upload the audio/video file directly for full transcription."
@@ -2400,7 +2405,7 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
                         f"YouTube subtitle fallback failed: {subtitle_exc}"
                     ) from subtitle_exc
         else:
-            if not ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK:
+            if not remote_media_fallback_available():
                 raise RuntimeError("Direct remote media downloads are disabled in fast mode. Please upload the audio/video file instead.")
             temp_audio_path = download_audio(url, temp_dir)
 

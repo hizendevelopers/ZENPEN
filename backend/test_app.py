@@ -432,6 +432,10 @@ def test_analyze_url_source_uses_real_webpage_content(monkeypatch):
 
 def test_analyze_url_source_fails_fast_when_youtube_text_is_unavailable(monkeypatch):
     monkeypatch.setattr('app.ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK', False)
+    monkeypatch.setattr('app.APIFY_TOKEN', '')
+    monkeypatch.setattr('app.YOUTUBE_PROXY_HTTP', '')
+    monkeypatch.setattr('app.YOUTUBE_PROXY_HTTPS', '')
+    monkeypatch.setattr('app.YOUTUBE_PROXY_URL', '')
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
     monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('no subtitles')))
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
@@ -556,6 +560,14 @@ def test_map_public_error_message_hides_raw_codes():
 def test_map_public_error_message_handles_site_block():
     message = map_public_error_message('That website blocked direct content extraction. Please try another public URL or upload the media file.')
     assert 'blocked direct content extraction' in message
+
+
+def test_remote_media_fallback_available_when_apify_or_proxy_exists(monkeypatch):
+    from app import remote_media_fallback_available
+
+    monkeypatch.setattr('app.ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK', False)
+    monkeypatch.setattr('app.APIFY_TOKEN', 'token')
+    assert remote_media_fallback_available() is True
 
 
 def test_fallback_article_avoids_old_template_sections():

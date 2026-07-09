@@ -13,6 +13,8 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from functools import lru_cache
+from html import unescape
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -22,7 +24,7 @@ import numpy as np
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.staticfiles import StaticFiles
 from nltk.tokenize import sent_tokenize
@@ -88,6 +90,29 @@ class ArticlesRequest(BaseModel):
     topics: list[str] = []
     selected_topics: list[str]
     article_count: int = 1
+    article_type: str = "Blog Article"
+    target_audience: str = "General readers"
+    source_context: str = ""
+
+
+class PublishArticleRequest(BaseModel):
+    headline: str
+    summary: str
+    topics: list[str] = []
+    selected_topics: list[str] = []
+    articles: list[dict[str, object]]
+    source_type: str = "url"
+    source_url: Optional[str] = None
+    source_file_name: Optional[str] = None
+    source_mime_type: Optional[str] = None
+    query: str = "Give breaking news and main points"
+
+
+class ExportArticleRequest(BaseModel):
+    title: str
+    topic: str
+    content_html: str
+    format: str = "txt"
 
 
 class QuietYtdlpLogger:
@@ -135,6 +160,31 @@ GENERIC_TOPIC_TITLES = {
     "strong", "explicit", "article", "content", "message", "video", "story", "analysis",
     "commitment",
 }
+SUPPORTED_UPLOAD_MIME_PREFIXES = ("video/", "audio/")
+SUPPORTED_MEDIA_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mov", ".mkv", ".avi", ".webm"}
+UNSUPPORTED_DIRECT_SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+ARTICLE_TYPE_INSTRUCTIONS = {
+    "Blog Article": "Write a polished editorial blog article with a clear narrative arc, informative tone, and reader-friendly explanations.",
+    "News Article": "Write in a neutral newsroom style with a sharp headline, an efficient lead paragraph, key details first, then context and developments.",
+    "How-to Guide": "Write as a practical step-by-step guide with clear instructional subheadings, helpful sequencing, and concise examples.",
+    "Listicle": "Write as a high-quality list-based article with dynamic numbered sections and crisp transitions, not as a shallow clickbait list.",
+    "Review": "Write as a balanced review that weighs strengths, weaknesses, evidence, and audience relevance without sounding promotional.",
+    "SEO Article": "Write as a search-optimized long-form article with clean structure, semantic keyword coverage, strong intent match, and direct answers.",
+}
+FILLER_PATTERNS = [
+    r"\b(?:um+|uh+|erm|hmm+)\b",
+    r"\b(?:you know|i mean|kind of|sort of)\b",
+    r"\[(?:music|applause|laughter|noise)[^\]]*\]",
+    r"\(?(?:music|applause|laughter|noise)\)?",
+]
+RAW_ERROR_PATTERNS = [
+    r"\b\d{3}\b",
+    r"traceback",
+    r"runtimeerror",
+    r"googleapierror",
+    r"httpx\.",
+    r"youtube transcript fallback failed",
+]
 
 
 def dependency_status() -> dict[str, bool | str]:
@@ -253,6 +303,63 @@ def get_youtube_transcript_api_class():
     return YOUTUBE_TRANSCRIPT_API_CLASS
 
 
+def source_kind_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    suffix = Path(path).suffix.lower()
+    if is_youtube_url(url):
+        return "youtube"
+    if suffix in UNSUPPORTED_DIRECT_SOURCE_EXTENSIONS:
+        return "unsupported"
+    if suffix in SUPPORTED_MEDIA_EXTENSIONS:
+        return "media-url"
+    return "web-url"
+
+
+def map_public_error_message(raw_message: str, *, context: str = "analysis") -> str:
+    message = (raw_message or "").strip()
+    lower = message.lower()
+    if not message:
+        return "Something went wrong while processing your request. Please try again."
+    if "password" in lower and "match" in lower:
+        return "Passwords do not match. Please check them and try again."
+    if "invalid email or password" in lower:
+        return "We could not log you in with those credentials."
+    if "could not create your account" in lower:
+        return "We could not create your account right now. Please try again."
+    if "please provide a url or upload" in lower:
+        return "Please add a valid source before continuing."
+    if "unsupported" in lower and "image" in lower:
+        return "Image links are not supported yet. Please use a webpage, YouTube/video URL, or upload an audio/video file."
+    if "unsupported" in lower and "file" in lower:
+        return "That file type is not supported. Please upload an audio or video file."
+    if "failed to load audio" in lower or ("ffmpeg" in lower and "invalid data found when processing input" in lower):
+        return "That file could not be processed as audio or video. Please upload a supported media file."
+    if "youtube" in lower and "requires authenticated cookies" in lower:
+        return "This YouTube video cannot be accessed from the server right now. Please try another video or upload the file directly."
+    if "rate" in lower and "limit" in lower:
+        return "The AI service is busy right now. Please wait a moment and try again."
+    if "timeout" in lower:
+        return "The request took too long to complete. Please try again."
+    if "unsupported video format" in lower:
+        return "Please upload a supported audio or video file."
+    if "gemini" in lower or "googleapierror" in lower:
+        return "The AI writing service could not complete this request right now. Please try again."
+    if any(re.search(pattern, lower) for pattern in RAW_ERROR_PATTERNS):
+        if context == "login":
+            return "We could not complete the login request right now."
+        return "We could not complete the request right now. Please try again."
+    return message if len(message) < 220 else "We could not complete the request right now. Please try again."
+
+
+def get_beautiful_soup_class():
+    try:
+        module = importlib.import_module("bs4")
+        return getattr(module, "BeautifulSoup")
+    except Exception as exc:
+        raise RuntimeError(build_missing_dependency_message("beautifulsoup4")) from exc
+
+
 def supabase_is_configured() -> bool:
     return bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY)
 
@@ -265,8 +372,9 @@ def get_api_config() -> dict[str, object]:
             "publishableKey": SUPABASE_PUBLISHABLE_KEY or None,
         },
         "queue": {
-            "enabled": False,
+            "enabled": background_url_jobs_available(),
         },
+        "supportedSources": ["web-url", "youtube", "media-url", "uploaded-audio", "uploaded-video"],
     }
 
 
@@ -852,6 +960,340 @@ def sanitize_inline_html(text: str) -> str:
         html,
     )
     return html.strip()
+
+
+def clean_source_text(text: str) -> str:
+    normalized = unescape((text or "").replace("\r", "\n"))
+    normalized = re.sub(r"<[^>]+>", " ", normalized)
+    normalized = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", normalized)
+    normalized = normalized.replace("♪", " ")
+    cleaned_lines: list[str] = []
+    seen = set()
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[A-Z][A-Za-z0-9 _-]{0,24}:\s*", "", line)
+        for pattern in FILLER_PATTERNS:
+            line = re.sub(pattern, " ", line, flags=re.IGNORECASE)
+        line = re.sub(r"\s{2,}", " ", line).strip(" -")
+        if len(line) < 20:
+            continue
+        lowered = line.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned_lines.append(line)
+    joined = " ".join(cleaned_lines)
+    sentences = split_sentences(joined)
+    deduped_sentences: list[str] = []
+    seen_sentences = set()
+    for sentence in sentences:
+        normalized_sentence = re.sub(r"\W+", " ", sentence.lower()).strip()
+        if not normalized_sentence or normalized_sentence in seen_sentences:
+            continue
+        seen_sentences.add(normalized_sentence)
+        deduped_sentences.append(sentence)
+    return " ".join(deduped_sentences).strip()
+
+
+def extract_webpage_content(url: str) -> dict[str, object]:
+    BeautifulSoup = get_beautiful_soup_class()
+    response = httpx.get(
+        url,
+        timeout=20.0,
+        follow_redirects=True,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/127.0.0.0 Safari/537.36"
+            )
+        },
+    )
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+        raise RuntimeError("Only webpage URLs are supported for direct link analysis right now.")
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag_name in ("script", "style", "noscript", "svg", "footer", "nav", "aside"):
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    meta_description = ""
+    meta_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    if meta_tag and meta_tag.get("content"):
+        meta_description = str(meta_tag.get("content")).strip()
+
+    headings = [
+        " ".join(tag.get_text(" ", strip=True).split())
+        for tag in soup.find_all(["h1", "h2", "h3"], limit=12)
+        if tag.get_text(" ", strip=True)
+    ]
+    paragraphs = [
+        " ".join(tag.get_text(" ", strip=True).split())
+        for tag in soup.find_all(["p", "li"], limit=80)
+        if tag.get_text(" ", strip=True)
+    ]
+    raw_content = "\n".join(filter(None, [title, meta_description, *headings, *paragraphs]))
+    cleaned = clean_source_text(raw_content)
+    if len(cleaned) < 120:
+        raise RuntimeError("We could not extract enough readable text from that URL.")
+
+    return {
+        "title": title or urlparse(url).netloc,
+        "meta_description": meta_description,
+        "headings": headings,
+        "content": cleaned,
+    }
+
+
+def build_topic_details_bundle(summary_text: str) -> tuple[list[dict[str, str]], bool]:
+    details = get_topic_details_from_summary(summary_text)
+    used_fallback = all(title_needs_editorial_rewrite(item.get("title", "")) for item in details[: min(3, len(details))]) if details else True
+    return details, used_fallback
+
+
+def build_article_slug(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", strip_html_tags(title).lower()).strip("-")
+    return slug[:80] or "generated-article"
+
+
+def build_meta_title(headline: str, topic: str, article_type: str) -> str:
+    base = strip_html_tags(topic or headline or article_type)
+    fallback = strip_html_tags(headline or article_type)
+    candidate = base if len(base) >= 18 else f"{base} | {fallback}".strip(" |")
+    return candidate[:60].strip() or fallback[:60].strip() or "Generated Article"
+
+
+def build_meta_description(summary_text: str) -> str:
+    summary_points = [line[2:].strip() for line in summary_text.splitlines() if line.strip().startswith("-")]
+    source = " ".join(summary_points) if summary_points else summary_text
+    source = re.sub(r"\s+", " ", strip_html_tags(source)).strip()
+    return source[:157].rstrip(" ,.;:-") + ("..." if len(source) > 157 else "")
+
+
+def build_geo_keywords(topic: str, secondary_keywords: list[str]) -> list[str]:
+    seed = [topic] + secondary_keywords[:3]
+    phrases: list[str] = []
+    for keyword in seed:
+        clean = strip_html_tags(keyword).strip()
+        if not clean:
+            continue
+        phrases.extend([
+            f"What is {clean}?",
+            f"Why does {clean} matter?",
+            f"{clean} explained",
+        ])
+    return list(dict.fromkeys(phrases))[:6]
+
+
+def build_dynamic_subheadings(topic: str, summary_points: list[str], article_type: str) -> list[str]:
+    clean_topic = strip_html_tags(topic or "Main Topic").strip() or "Main Topic"
+    keywords = extract_top_keywords(" ".join(summary_points) or clean_topic, limit=4)
+    lead_keyword = keywords[0] if keywords else clean_topic
+    support_keyword = keywords[1] if len(keywords) > 1 else clean_topic
+    context_keyword = keywords[2] if len(keywords) > 2 else support_keyword
+
+    if article_type == "News Article":
+        return [
+            f"Key Developments Around {clean_topic}",
+            f"The Context Behind {lead_keyword}",
+            f"Why {support_keyword} Matters Now",
+            f"What to Watch Next in {context_keyword}",
+        ]
+    if article_type == "How-to Guide":
+        return [
+            f"Understanding the Core Challenge in {clean_topic}",
+            f"Steps That Move {lead_keyword} Forward",
+            f"Common Mistakes Around {support_keyword}",
+            f"How to Apply These Lessons in Practice",
+        ]
+    if article_type == "Listicle":
+        return [
+            f"The First Shift Shaping {clean_topic}",
+            f"Why {lead_keyword} Changes the Conversation",
+            f"Lessons Hidden Inside {support_keyword}",
+            f"What Makes {context_keyword} Worth Watching",
+        ]
+    if article_type == "Review":
+        return [
+            f"What Holds {clean_topic} Together",
+            f"Where {lead_keyword} Delivers",
+            f"Where {support_keyword} Falls Short",
+            f"The Larger Takeaway for Readers",
+        ]
+    if article_type == "SEO Article":
+        return [
+            f"What {clean_topic} Means for Search Intent",
+            f"The Core Signals Behind {lead_keyword}",
+            f"How {support_keyword} Shapes the Topic",
+            f"Why {context_keyword} Deserves Closer Attention",
+        ]
+    return [
+        f"How {clean_topic} Takes Shape",
+        f"What {lead_keyword} Reveals",
+        f"Why {support_keyword} Carries Weight",
+        f"Where the Bigger Argument Lands",
+    ]
+
+
+def deduplicate_article_html(article_html: str) -> str:
+    blocks = re.findall(r"<(h2|h3|p|li)>(.*?)</\1>", article_html, flags=re.IGNORECASE | re.DOTALL)
+    seen_blocks = set()
+    cleaned_chunks: list[str] = []
+    for tag, inner in blocks:
+        text = re.sub(r"\s+", " ", strip_html_tags(inner)).strip()
+        normalized = re.sub(r"\W+", " ", text.lower()).strip()
+        if not normalized or normalized in seen_blocks:
+            continue
+        seen_blocks.add(normalized)
+        if tag.lower() == "p":
+            sentences = split_sentences(text)
+            unique_sentences: list[str] = []
+            seen_sentences = set()
+            for sentence in sentences:
+                ns = re.sub(r"\W+", " ", sentence.lower()).strip()
+                if not ns or ns in seen_sentences:
+                    continue
+                seen_sentences.add(ns)
+                unique_sentences.append(sentence)
+            text = " ".join(unique_sentences) or text
+            cleaned_chunks.append(f"<p>{text}</p>")
+        else:
+            cleaned_chunks.append(f"<{tag.lower()}>{inner}</{tag.lower()}>")
+    return postprocess_article_html("\n".join(cleaned_chunks))
+
+
+def score_article_output(
+    *,
+    title: str,
+    meta_title: str,
+    meta_description: str,
+    focus_keyword: str,
+    secondary_keywords: list[str],
+    geo_keywords: list[str],
+    content_html: str,
+    article_type: str,
+) -> dict[str, object]:
+    text = strip_html_tags(content_html)
+    h2_count = len(re.findall(r"<h2>", content_html, flags=re.IGNORECASE))
+    h3_count = len(re.findall(r"<h3>", content_html, flags=re.IGNORECASE))
+    p_count = len(re.findall(r"<p>", content_html, flags=re.IGNORECASE))
+    seo_score = 0
+    geo_score = 0
+    seo_checks = []
+    geo_checks = []
+
+    title_ok = 20 <= len(title) <= 70
+    seo_score += 2 if title_ok else 1
+    seo_checks.append({"label": "Title quality", "score": 2 if title_ok else 1, "note": "Title length and clarity."})
+
+    meta_ok = 35 <= len(meta_title) <= 60 and 80 <= len(meta_description) <= 160
+    seo_score += 2 if meta_ok else 1
+    seo_checks.append({"label": "Meta description", "score": 2 if meta_ok else 1, "note": "Meta title and description are within useful SEO ranges."})
+
+    heading_ok = h2_count >= 1 and h3_count >= 2
+    seo_score += 2 if heading_ok else 1
+    seo_checks.append({"label": "Heading structure", "score": 2 if heading_ok else 1, "note": "The article uses a readable heading hierarchy."})
+
+    keyword_mentions = sum(1 for kw in [focus_keyword, *secondary_keywords[:3]] if kw and kw.lower() in text.lower())
+    seo_score += 2 if keyword_mentions >= 2 else 1
+    seo_checks.append({"label": "Keyword usage", "score": 2 if keyword_mentions >= 2 else 1, "note": "Primary and secondary keywords are reflected naturally."})
+
+    readability_ok = p_count >= 5 and len(text.split()) >= 450
+    seo_score += 2 if readability_ok else 1
+    seo_checks.append({"label": "Readability", "score": 2 if readability_ok else 1, "note": "Paragraph depth and article length support readability."})
+
+    search_intent_ok = article_type in ARTICLE_TYPE_INSTRUCTIONS and focus_keyword.lower() in text.lower()
+    geo_score += 3 if search_intent_ok else 1
+    geo_checks.append({"label": "Search intent match", "score": 3 if search_intent_ok else 1, "note": "The article aligns with the selected format and core topic."})
+
+    geo_density = sum(1 for phrase in geo_keywords[:4] if phrase.split("?")[0].lower() in text.lower())
+    geo_score += 3 if geo_density >= 1 else 1
+    geo_checks.append({"label": "AI search phrasing", "score": 3 if geo_density >= 1 else 1, "note": "The article includes answer-style phrasing for AI search engines."})
+
+    uniqueness_ok = len(set(split_sentences(text))) >= max(8, len(split_sentences(text)) // 2)
+    geo_score += 2 if uniqueness_ok else 1
+    geo_checks.append({"label": "Content uniqueness", "score": 2 if uniqueness_ok else 1, "note": "Repeated sections are minimized."})
+
+    local_relevance_ok = any(term.lower() in text.lower() for term in ["market", "audience", "readers", "region", "industry"])
+    geo_score += 2 if local_relevance_ok else 1
+    geo_checks.append({"label": "Context relevance", "score": 2 if local_relevance_ok else 1, "note": "The article reflects who the content is for and why it matters."})
+
+    suggestions: list[str] = []
+    if not meta_ok:
+        suggestions.append("Tighten the meta title and meta description so they fit standard SEO lengths.")
+    if not heading_ok:
+        suggestions.append("Add more meaningful section headings to improve scanability.")
+    if keyword_mentions < 2:
+        suggestions.append("Weave the focus keyword and supporting terms into the article more naturally.")
+    if geo_density < 1:
+        suggestions.append("Add answer-style phrases that align with AI search and summary engines.")
+
+    return {
+        "seoScore": min(seo_score, 10),
+        "geoScore": min(geo_score, 10),
+        "seoChecks": seo_checks,
+        "geoChecks": geo_checks,
+        "improvementSuggestions": suggestions,
+    }
+
+
+def build_article_package(
+    *,
+    headline_text: str,
+    summary_text: str,
+    topic: str,
+    article_type: str,
+    source_context: str,
+    target_audience: str,
+    variant_index: int = 0,
+) -> dict[str, object]:
+    content = generate_article_html(
+        headline_text=headline_text,
+        summary_text=summary_text,
+        topic=topic,
+        article_type=article_type,
+        source_context=source_context,
+        target_audience=target_audience,
+        variant_index=variant_index,
+    )
+    focus_keyword = strip_html_tags(topic).strip() or strip_html_tags(headline_text).strip()
+    secondary_keywords = [
+        keyword for keyword in extract_top_keywords(f"{summary_text} {topic}", limit=6)
+        if keyword.lower() != focus_keyword.lower()
+    ][:5]
+    geo_keywords = build_geo_keywords(focus_keyword, secondary_keywords)
+    meta_title = build_meta_title(headline_text, topic, article_type)
+    meta_description = build_meta_description(summary_text)
+    scoring = score_article_output(
+        title=headline_text,
+        meta_title=meta_title,
+        meta_description=meta_description,
+        focus_keyword=focus_keyword,
+        secondary_keywords=secondary_keywords,
+        geo_keywords=geo_keywords,
+        content_html=content,
+        article_type=article_type,
+    )
+    return {
+        "topic": topic,
+        "article_type": article_type,
+        "content": content,
+        "image_url": build_article_image_url(topic),
+        "meta_title": meta_title,
+        "meta_description": meta_description,
+        "slug": build_article_slug(meta_title),
+        "focus_keyword": focus_keyword,
+        "secondary_keywords": secondary_keywords,
+        "geo_keywords": geo_keywords,
+        "seo_report": scoring,
+    }
 
 
 def clean_topic_title(title: str) -> str:
@@ -1533,25 +1975,148 @@ def fallback_article(headline_text: str, summary_text: str, topic: Optional[str]
     support = body_points[1] if len(body_points) > 1 else lead
     detail = body_points[2] if len(body_points) > 2 else support
     closing_support = body_points[3] if len(body_points) > 3 else detail
+    section_one, section_two, section_three, section_four = build_dynamic_subheadings(topic_title, body_points, "Blog Article")
     return postprocess_article_html(
         f"""
 <h2>{headline_text}</h2>
 <p>{lead} That opening detail immediately gives <strong>{topic_title}</strong> a sense of consequence. It suggests a story that is not only timely, but layered enough to reward closer attention. The point is not simply that something happened. The point is that the development carries implications, and those implications become clearer once the surrounding examples are placed side by side.</p>
 <p>{support} Read together, the early signals create the outline of a bigger argument. They point toward a shift in priorities, a contest of ideas, or a change in public mood that deserves more than a passing mention. That is where the article gains its strength: it treats the subject as something substantial enough to explain, not merely something dramatic enough to repeat.</p>
-<h3>How the Story Builds Its Case</h3>
+<h3>{section_one}</h3>
 <p>{detail} One of the most persuasive qualities of <strong>{topic_title}</strong> is the way the evidence accumulates. Each example adds pressure to the same central claim, making the story feel grounded rather than speculative. When readers can see how the argument is supported step by step, the writing becomes more convincing without having to overstate its point.</p>
 <p>{support} That structure matters. Strong editorial writing does not rely on noise. It relies on sequence, emphasis, and proportion. Here, the sequence gives the subject momentum, while the emphasis makes clear which ideas deserve the reader's attention first.</p>
-<h3>Why the Details Matter</h3>
+<h3>{section_two}</h3>
 <p>{lead} {support} These details work because they turn an abstract theme into something tangible. They give the reader enough specificity to understand what is at stake, who is affected, and why the issue feels larger than a single moment. That is the difference between a thin recap and a serious article.</p>
 <p>{detail} {closing_support} Once these details are allowed to sit together, the topic begins to reveal its broader shape. It becomes easier to see the direction of the argument, the pressures behind it, and the reasons it may continue to matter long after the immediate event fades from view.</p>
-<h3>The Wider Significance</h3>
+<h3>{section_three}</h3>
 <p><strong>{topic_title}</strong> carries weight because it opens into a larger conversation. It touches the logic behind decisions, the values guiding those decisions, and the public consequences that follow. Topics with that range rarely stay confined to one headline. They tend to echo across policy, culture, business, or civic life, depending on the material behind them.</p>
 <p>That is also what makes the article readable. Readers are not being handed disconnected talking points. They are being given a coherent interpretation of why the issue deserves sustained attention. The material holds together because the examples reinforce the same core direction instead of competing with one another.</p>
-<h3>Where the Argument Lands</h3>
+<h3>{section_four}</h3>
 <p>{closing_support} By the end, the subject feels more fully formed. The strongest impression is not simply that the topic is relevant, but that it offers a useful way to understand a bigger pattern already taking shape. That makes it a stronger editorial subject than a one-dimensional trend piece or a narrow update.</p>
 <p>The article lands best when it leaves the reader with clarity rather than volume. That clarity comes from connecting examples to meaning, and from treating <strong>{topic_title}</strong> as a live issue with lasting significance. When the writing does that well, the subject no longer feels like raw source material. It feels like a finished argument.</p>
 """
     )
+
+
+def fallback_article_for_type(
+    headline_text: str,
+    summary_text: str,
+    topic: Optional[str],
+    article_type: str,
+) -> str:
+    base = fallback_article(headline_text, summary_text, topic)
+    if article_type == "News Article":
+        topic_title = topic or "the story"
+        points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")] or [summary_text]
+        lead = points[0]
+        context = points[1] if len(points) > 1 else lead
+        update = points[2] if len(points) > 2 else context
+        section_one, section_two, _, section_four = build_dynamic_subheadings(topic_title, points, "News Article")
+        return postprocess_article_html(
+            f"""
+<h2>{headline_text}</h2>
+<p>{lead} The development places <strong>{topic_title}</strong> at the center of the story and frames the issue as one with immediate relevance beyond a single update.</p>
+<h3>{section_one}</h3>
+<p>{context} The core facts indicate a pattern that is still unfolding, which is why the subject warrants direct, sober reporting rather than promotional framing.</p>
+<h3>{section_two}</h3>
+<p>{update} Taken together, the available details provide the background needed to understand why this development matters now and how it connects to the broader context surrounding it.</p>
+<h3>{section_four}</h3>
+<p>The clearest takeaway is that the story should be followed for what it reveals over time, not just for its immediate headline value. That makes it a stronger news subject than a one-off talking point.</p>
+"""
+        )
+    return base
+
+
+def proofread_article_html(
+    article_html: str,
+    *,
+    article_type: str,
+    topic: str,
+) -> str:
+    prompt = f"""
+You are proofreading an article before publication.
+
+Article type:
+{article_type}
+
+Topic:
+{topic}
+
+Instructions:
+- Improve grammar, punctuation, and flow.
+- Keep the facts, meaning, and structure intact.
+- Remove repeated sentences, filler openings, and awkward transitions.
+- Do not add new facts.
+- Return clean HTML only using <h2>, <h3>, <p>, <ul>, <li>, <strong>.
+
+Article HTML:
+{article_html}
+"""
+    try:
+        return postprocess_article_html(gemini_generate_text(prompt)) or postprocess_article_html(article_html)
+    except Exception:
+        return postprocess_article_html(article_html)
+
+
+def generate_article_html(
+    *,
+    headline_text: str,
+    summary_text: str,
+    topic: Optional[str],
+    article_type: str,
+    source_context: str,
+    target_audience: str,
+    variant_index: int = 0,
+) -> str:
+    article_type = article_type if article_type in ARTICLE_TYPE_INSTRUCTIONS else "Blog Article"
+    topic_text = topic or "Main Topic"
+    source_excerpt = clean_source_text(source_context or summary_text)[:4500]
+    keywords = extract_top_keywords(f"{summary_text} {topic_text} {source_excerpt}", limit=8)
+    uniqueness_instruction = (
+        "Use a fresh structure and angle for this version."
+        if variant_index == 0
+        else f"Create a distinct variation #{variant_index + 1} with a noticeably different angle, examples emphasis, and subheading sequence."
+    )
+    prompt = f"""
+You are a senior editorial writer and AI content strategist.
+
+Selected article type:
+{article_type}
+
+Topic:
+{topic_text}
+
+Target audience:
+{target_audience}
+
+Source summary:
+{summary_text}
+
+Cleaned source context:
+{source_excerpt}
+
+Supporting keywords:
+{", ".join(keywords)}
+
+Instructions:
+- {ARTICLE_TYPE_INSTRUCTIONS[article_type]}
+- Base the article strictly on the source context and summary above.
+- Do not copy transcript phrasing directly.
+- Remove filler wording, transcript noise, timestamps, speaker labels, and repetition.
+- Use the selected topic as the center of the article.
+- Generate unique headings and subheadings based on the actual source content.
+- Keep the writing polished, publication-ready, and natural.
+- Avoid generic filler openings such as "In today's digital world" or "It is important to note."
+- {uniqueness_instruction}
+- Return clean HTML only using <h2>, <h3>, <p>, <ul>, <li>, <strong>.
+"""
+    try:
+        article_text = gemini_generate_text(prompt)
+        article_html = postprocess_article_html(article_text) or fallback_article_for_type(headline_text, summary_text, topic_text, article_type)
+    except Exception:
+        article_html = fallback_article_for_type(headline_text, summary_text, topic_text, article_type)
+
+    article_html = deduplicate_article_html(article_html)
+    return proofread_article_html(article_html, article_type=article_type, topic=topic_text)
 
 
 def build_fast_context_from_transcript(transcript: str, chunks: list[str]) -> str:
@@ -1627,54 +2192,34 @@ Summary:
 def generate_news_article(headline_text: str, summary_text: str, topic: Optional[str] = None) -> str:
     if not headline_text.strip():
         headline_text = "Media summary"
-
-    topic_instruction = f"Focus specifically on the topic '{topic}'." if topic else "Use the overall summary as the focus."
-    prompt = f"""
-You are an experienced editorial writer, video analyst, and professional article writer.
-
-Headline:
-{headline_text}
-
-Summary:
-{summary_text}
-
-Instructions:
-- Write a complete article only on the selected topic.
-- Base the article strictly on the source material summarized above.
-- Do not invent facts, quotes, names, or unsupported claims.
-- Write in a natural, human, professional editorial style.
-- Avoid robotic filler phrases and generic transitions.
-- Do not write a topic brief, content plan, analysis note, or summary card.
-- Do not use headings such as "Why This Topic Stands Out", "Key Developments", "What It Suggests", or similar template labels.
-- Do not say "this article discusses", "the source material says", "the selected topic is", or any other meta-writing phrase.
-- Avoid phrases such as "In today's fast-paced world", "It is important to note", "In conclusion", "As we navigate", and "Unlocking the power of".
-- Write between 900 and 1200 words unless factual accuracy requires less.
-- Include:
-  - one strong <h2> headline
-  - a strong opening paragraph
-  - 3 to 5 meaningful <h3> section headings
-  - detailed body paragraphs in <p> tags
-  - a thoughtful closing paragraph
-- Use <strong> only where emphasis is genuinely useful.
-- Return clean HTML only using: <h2>, <h3>, <p>, <ul>, <li>, <strong>.
-- Do not return markdown.
-- {topic_instruction}
-"""
-    try:
-        article_text = gemini_generate_text(prompt)
-        return postprocess_article_html(article_text) or fallback_article(headline_text, summary_text, topic)
-    except Exception:
-        return fallback_article(headline_text, summary_text, topic)
+    return generate_article_html(
+        headline_text=headline_text,
+        summary_text=summary_text,
+        topic=topic,
+        article_type="News Article",
+        source_context=summary_text,
+        target_audience="General readers",
+        variant_index=0,
+    )
 
 
 def get_topics_from_summary(summary_text: str) -> list[str]:
     return [item["title"] for item in get_topic_details_from_summary(summary_text)]
 
 
-def enrich_analysis(result: dict[str, str], generate_article: bool = False, selected_topics: Optional[list[str]] = None, article_count: int = 1) -> dict[str, object]:
+def enrich_analysis(
+    result: dict[str, str],
+    generate_article: bool = False,
+    selected_topics: Optional[list[str]] = None,
+    article_count: int = 1,
+    article_type: str = "Blog Article",
+    target_audience: str = "General readers",
+    source_context: str = "",
+    source_type: str = "url",
+) -> dict[str, object]:
     headline = result.get("headline", "Media summary")
     summary = result.get("summary", "")
-    topic_details = get_topic_details_from_summary(summary)
+    topic_details, used_fallback_topics = build_topic_details_bundle(summary)
     topics = [item["title"] for item in topic_details]
     payload: dict[str, object] = {
         "headline": headline,
@@ -1682,6 +2227,14 @@ def enrich_analysis(result: dict[str, str], generate_article: bool = False, sele
         "topics": topics,
         "topic_details": topic_details,
         "articles": [],
+        "article_type": article_type,
+        "target_audience": target_audience,
+        "source_type": source_type,
+        "source_context_preview": clean_source_text(source_context or summary)[:700],
+        "topic_generation_warning": (
+            "Topic ideas were simplified because the source content could not be fully expanded into richer angles."
+            if used_fallback_topics else ""
+        ),
     }
 
     if not generate_article:
@@ -1689,13 +2242,17 @@ def enrich_analysis(result: dict[str, str], generate_article: bool = False, sele
 
     topics_to_use = selected_topics or topics[:3] or ["Main topic"]
     articles: list[dict[str, str]] = []
-    for topic in topics_to_use:
-        for _ in range(max(article_count, 1)):
-            articles.append({
-                "topic": topic,
-                "content": generate_news_article(headline, summary, topic),
-                "image_url": build_article_image_url(topic),
-            })
+    for topic_index, topic in enumerate(topics_to_use):
+        for variant_index in range(max(article_count, 1)):
+            articles.append(build_article_package(
+                headline_text=headline,
+                summary_text=summary,
+                topic=topic,
+                article_type=article_type,
+                source_context=source_context or summary,
+                target_audience=target_audience,
+                variant_index=(topic_index * max(article_count, 1)) + variant_index,
+            ))
     payload["articles"] = articles
     return payload
 
@@ -1717,7 +2274,7 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
         with tempfile.TemporaryDirectory(prefix="media-analyzer-extract-") as temp_dir:
             extracted_audio_path = str(Path(temp_dir) / "extracted_audio.wav")
             audio_source_path = extract_audio_from_video(video_path, extracted_audio_path)
-            transcript = transcribe_audio(audio_source_path)
+            transcript = clean_source_text(transcribe_audio(audio_source_path))
             if not transcript.strip():
                 return fallback_summary("", query)
             chunks = chunk_text(transcript)
@@ -1733,7 +2290,7 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
     if not audio_source_path:
         raise RuntimeError("No audio source provided or audio extraction failed")
 
-    transcript = transcribe_audio(audio_source_path)
+    transcript = clean_source_text(transcribe_audio(audio_source_path))
     if not transcript.strip():
         return fallback_summary("", query)
 
@@ -1750,6 +2307,7 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
 
 
 def analyze_text_content(transcript: str, query: str = "Summarize the content") -> dict[str, str]:
+    transcript = clean_source_text(transcript)
     if not transcript.strip():
         return fallback_summary("", query)
 
@@ -1768,9 +2326,26 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content") 
 def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[str, object]:
     transcript_override: Optional[str] = None
     temp_audio_path: Optional[str] = None
+    source_type = source_kind_from_url(url)
+
+    if source_type == "unsupported":
+        raise RuntimeError("Direct image links are not supported yet. Please use a webpage, YouTube/video URL, or upload an audio/video file.")
+
+    if source_type == "web-url":
+        webpage = extract_webpage_content(url)
+        result = analyze_text_content(
+            str(webpage.get("content") or ""),
+            query=query or "Summarize the content",
+        )
+        return enrich_analysis(
+            result,
+            generate_article=False,
+            source_context=str(webpage.get("content") or ""),
+            source_type="web-url",
+        )
 
     with tempfile.TemporaryDirectory(prefix="media-analyzer-url-") as temp_dir:
-        if is_youtube_url(url):
+        if source_type == "youtube":
             transcript_error: Optional[Exception] = None
             try:
                 transcript_override = fetch_youtube_transcript_text(url)
@@ -1797,7 +2372,7 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
 
         if transcript_override is not None:
             result = analyze_text_content(
-                transcript_override,
+                clean_source_text(transcript_override),
                 query=query or "Summarize the content",
             )
         else:
@@ -1806,7 +2381,12 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
                 query=query or "Summarize the content",
             )
 
-    return enrich_analysis(result, generate_article=False)
+    return enrich_analysis(
+        result,
+        generate_article=False,
+        source_context=transcript_override or result.get("summary", ""),
+        source_type="youtube" if source_type == "youtube" else "media-url",
+    )
 
 
 def serialize_job_status(job: Job) -> dict[str, object]:
@@ -1833,6 +2413,64 @@ def serialize_job_status(job: Job) -> dict[str, object]:
         "status": status,
         "queued": True,
     }
+
+
+def render_article_to_docx_bytes(title: str, topic: str, content_html: str) -> bytes:
+    try:
+        from docx import Document
+    except Exception as exc:
+        raise RuntimeError("DOCX export is not available on this deployment yet.") from exc
+
+    document = Document()
+    document.add_heading(title, level=1)
+    if topic:
+        document.add_paragraph(f"Topic: {topic}")
+    for line in re.split(r"\n+", postprocess_article_html(content_html)):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("<h2>"):
+            document.add_heading(strip_html_tags(line), level=1)
+        elif line.startswith("<h3>"):
+            document.add_heading(strip_html_tags(line), level=2)
+        elif line.startswith("<li>"):
+            document.add_paragraph(strip_html_tags(line), style="List Bullet")
+        else:
+            document.add_paragraph(strip_html_tags(line))
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def render_article_to_pdf_bytes(title: str, topic: str, content_html: str) -> bytes:
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except Exception as exc:
+        raise RuntimeError("PDF export is not available on this deployment yet.") from exc
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(title, styles["Title"])]
+    if topic:
+        story.append(Paragraph(f"<b>Topic:</b> {topic}", styles["BodyText"]))
+        story.append(Spacer(1, 8))
+    for line in re.split(r"\n+", postprocess_article_html(content_html)):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        text = strip_html_tags(stripped)
+        if stripped.startswith("<h2>"):
+            story.append(Paragraph(text, styles["Heading1"]))
+        elif stripped.startswith("<h3>"):
+            story.append(Paragraph(text, styles["Heading2"]))
+        else:
+            story.append(Paragraph(text, styles["BodyText"]))
+        story.append(Spacer(1, 6))
+    doc.build(story)
+    return buffer.getvalue()
 
 
 async def save_uploaded_file(upload: UploadFile, destination: Path) -> None:
@@ -1915,10 +2553,74 @@ def generate_articles_endpoint(payload: ArticlesRequest) -> JSONResponse:
         generate_article=True,
         selected_topics=selected_topics,
         article_count=payload.article_count,
+        article_type=payload.article_type,
+        target_audience=payload.target_audience,
+        source_context=payload.source_context,
     )
     if payload.topics:
         enriched_result["topics"] = payload.topics
     return JSONResponse({"success": True, "result": enriched_result})
+
+
+@app.post("/api/articles/publish")
+def publish_articles_endpoint(request: Request, payload: PublishArticleRequest) -> JSONResponse:
+    user = resolve_supabase_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Please log in before publishing a draft.")
+
+    result_payload = {
+        "headline": payload.headline,
+        "summary": payload.summary,
+        "topics": payload.topics,
+        "articles": payload.articles,
+    }
+    persist_analysis_to_supabase(
+        user_id=str(user["id"]),
+        source_type=payload.source_type,
+        source_url=payload.source_url,
+        source_file_name=payload.source_file_name,
+        source_mime_type=payload.source_mime_type,
+        query=payload.query,
+        result=result_payload,
+        selected_topics=payload.selected_topics,
+    )
+    return JSONResponse({"success": True, "message": "Draft saved successfully."})
+
+
+@app.post("/api/articles/export")
+def export_article_endpoint(payload: ExportArticleRequest):
+    title = payload.title.strip() or "Generated Article"
+    topic = payload.topic.strip()
+    content_html = payload.content_html or ""
+    export_format = payload.format.lower().strip()
+
+    if export_format == "txt":
+        text = f"{title}\n\nTopic: {topic}\n\n{strip_html_tags(content_html)}"
+        return StreamingResponse(
+            BytesIO(text.encode("utf-8")),
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{build_article_slug(title)}.txt"'},
+        )
+    if export_format == "html":
+        html = postprocess_article_html(content_html)
+        response = HTMLResponse(html)
+        response.headers["Content-Disposition"] = f'attachment; filename="{build_article_slug(title)}.html"'
+        return response
+    if export_format == "docx":
+        data = render_article_to_docx_bytes(title, topic, content_html)
+        return StreamingResponse(
+            BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{build_article_slug(title)}.docx"'},
+        )
+    if export_format == "pdf":
+        data = render_article_to_pdf_bytes(title, topic, content_html)
+        return StreamingResponse(
+            BytesIO(data),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{build_article_slug(title)}.pdf"'},
+        )
+    raise HTTPException(status_code=400, detail="Unsupported export format.")
 
 
 @app.post("/api/analyze")
@@ -1930,9 +2632,18 @@ async def analyze_endpoint(
     generate_article: bool = Form(False),
     article_count: int = Form(1),
     selected_topics: Optional[str] = Form(None),
+    article_type: str = Form("Blog Article"),
+    target_audience: str = Form("General readers"),
 ) -> JSONResponse:
     if not file and not url:
         raise HTTPException(status_code=400, detail="Please provide a URL or upload an audio/video file")
+    if file:
+        content_type = (file.content_type or "").lower()
+        suffix = Path(file.filename or "").suffix.lower()
+        mime_supported = any(content_type.startswith(prefix) for prefix in SUPPORTED_UPLOAD_MIME_PREFIXES)
+        suffix_supported = suffix in SUPPORTED_MEDIA_EXTENSIONS
+        if not (mime_supported or suffix_supported):
+            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload an audio or video file.")
 
     try:
         user = resolve_supabase_user(request)
@@ -1940,6 +2651,8 @@ async def analyze_endpoint(
             temp_dir_path = Path(temp_dir)
             temp_audio_path: Optional[str] = None
             topic_list = [topic.strip() for topic in (selected_topics or "").split(",") if topic.strip()]
+            source_context = ""
+            detected_source_type = "upload" if file else source_kind_from_url(url or "")
 
             if file:
                 suffix = Path(file.filename or "upload.wav").suffix.lower() or ".wav"
@@ -1956,14 +2669,20 @@ async def analyze_endpoint(
                     local_audio_path=temp_audio_path,
                     query=query or "Summarize the content",
                 )
+                source_context = str(result.get("summary") or "")
                 enriched_result = enrich_analysis(
                     result,
                     generate_article=generate_article,
                     selected_topics=topic_list or None,
                     article_count=article_count,
+                    article_type=article_type,
+                    target_audience=target_audience,
+                    source_context=source_context,
+                    source_type="upload",
                 )
             elif url:
                 enriched_result = analyze_url_source(url, query or "Summarize the content")
+                source_context = str(enriched_result.get("source_context_preview") or enriched_result.get("summary") or "")
                 if generate_article:
                     existing_topics = list(enriched_result.get("topics") or [])
                     base_result = {
@@ -1975,9 +2694,13 @@ async def analyze_endpoint(
                         generate_article=True,
                         selected_topics=topic_list or None,
                         article_count=article_count,
+                        article_type=article_type,
+                        target_audience=target_audience,
+                        source_context=source_context,
+                        source_type=detected_source_type,
                     )
                     enriched_result["topics"] = existing_topics
-            source = "uploaded-file" if file else "youtube-url"
+            source = "uploaded-file" if file else ("youtube-url" if detected_source_type == "youtube" else "remote-url")
             source_type = "upload" if file else "url"
             result_for_history = {
                 "headline": str(enriched_result.get("headline") or "Media summary"),
@@ -1999,8 +2722,11 @@ async def analyze_endpoint(
                 except Exception:
                     pass
             return JSONResponse({"success": True, "result": enriched_result})
+    except HTTPException:
+        raise
     except Exception as exc:
-        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+        print(f"[analyze_endpoint] {exc}", file=sys.stderr)
+        return JSONResponse({"success": False, "error": map_public_error_message(str(exc))}, status_code=500)
 
 
 @app.get("/{full_path:path}")

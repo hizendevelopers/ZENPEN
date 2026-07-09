@@ -6,6 +6,7 @@ from app import (
     analyze_text_content,
     app,
     analyze_url_source,
+    build_dynamic_subheadings,
     download_audio,
     extract_youtube_video_id,
     fallback_article,
@@ -13,6 +14,7 @@ from app import (
     find_http_urls_in_payload,
     build_local_topic_details,
     get_topic_details_from_summary,
+    map_public_error_message,
     sanitize_article_html,
     is_youtube_url,
     select_any_non_youtube_url,
@@ -117,6 +119,21 @@ def test_fallback_article_avoids_banned_meta_phrases():
     assert "Why This Topic Stands Out" not in html
     assert "the selected topic is" not in html.lower()
     assert "this article discusses" not in html.lower()
+
+
+def test_build_dynamic_subheadings_are_topic_aware():
+    headings = build_dynamic_subheadings(
+        "Saudi Infrastructure Expansion",
+        [
+            "Saudi Arabia is accelerating large infrastructure projects.",
+            "The discussion connects speed, execution, and national ambition.",
+            "Public messaging is tied to visible results and economic change.",
+        ],
+        "Blog Article",
+    )
+
+    assert len(headings) == 4
+    assert any("Saudi Infrastructure Expansion" in heading or "Saudi" in heading for heading in headings)
 
 
 def test_sanitize_article_html_wraps_orphan_text_in_paragraphs():
@@ -324,7 +341,19 @@ def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
     ])
-    monkeypatch.setattr('app.generate_news_article', lambda headline, summary, topic=None: f'Article for {topic}')
+    monkeypatch.setattr('app.build_article_package', lambda **kwargs: {
+        'topic': kwargs['topic'],
+        'article_type': kwargs['article_type'],
+        'content': f"Article for {kwargs['topic']}",
+        'image_url': 'https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=1200&q=80',
+        'meta_title': 'Topic A meta title',
+        'meta_description': 'Topic A meta description',
+        'slug': 'topic-a-meta-title',
+        'focus_keyword': kwargs['topic'],
+        'secondary_keywords': ['Keyword A'],
+        'geo_keywords': ['What is Topic A?'],
+        'seo_report': {'seoScore': 8, 'geoScore': 8, 'improvementSuggestions': []},
+    })
 
     response = client.post(
         '/api/analyze',
@@ -335,11 +364,21 @@ def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload['success'] is True
-    assert payload['result']['articles'] == [{
-        'topic': 'Topic A',
-        'content': 'Article for Topic A',
-        'image_url': 'https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=1200&q=80',
-    }]
+    assert payload['result']['articles'][0]['topic'] == 'Topic A'
+    assert payload['result']['articles'][0]['content'] == 'Article for Topic A'
+    assert payload['result']['articles'][0]['article_type'] == 'Blog Article'
+    assert payload['result']['articles'][0]['focus_keyword'] == 'Topic A'
+
+
+def test_analyze_endpoint_rejects_unsupported_upload_type():
+    response = client.post(
+        '/api/analyze',
+        data={'query': 'Summarize'},
+        files={'file': ('sample.txt', io.BytesIO(b'not media'), 'text/plain')},
+    )
+
+    assert response.status_code == 400
+    assert response.json()['detail'] == 'Unsupported file type. Please upload an audio or video file.'
 
 
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
@@ -369,6 +408,25 @@ def test_analyze_url_source_uses_subtitles_before_media_download(monkeypatch):
 
     assert result['topics'] == ['Topic A']
     assert result['articles'] == []
+
+
+def test_analyze_url_source_uses_real_webpage_content(monkeypatch):
+    monkeypatch.setattr('app.extract_webpage_content', lambda url: {
+        'title': 'Example Story',
+        'meta_description': 'A direct page description.',
+        'headings': ['Why This Story Matters'],
+        'content': 'This page explains a very specific policy shift, the audience it affects, and the evidence behind the debate.',
+    })
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Policy Shift Impact', 'explanation': 'How the shift affects readers.', 'importance': 'It changes public expectations.'}
+    ])
+
+    result = analyze_url_source('https://example.com/story', 'Summarize')
+
+    assert result['source_type'] == 'web-url'
+    assert result['topics'] == ['Policy Shift Impact']
+    assert result['source_context_preview']
 
 
 def test_analyze_endpoint_stays_synchronous_even_if_queue_is_available(monkeypatch):
@@ -409,7 +467,19 @@ def test_job_status_endpoint_returns_completed_result(monkeypatch):
 
 
 def test_generate_articles_endpoint_returns_articles(monkeypatch):
-    monkeypatch.setattr('app.generate_news_article', lambda headline, summary, topic=None: f'Article for {topic}')
+    monkeypatch.setattr('app.build_article_package', lambda **kwargs: {
+        'topic': kwargs['topic'],
+        'article_type': kwargs['article_type'],
+        'content': f"Article for {kwargs['topic']}",
+        'image_url': 'https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=1200&q=80',
+        'meta_title': 'Topic A meta title',
+        'meta_description': 'Topic A meta description',
+        'slug': 'topic-a-meta-title',
+        'focus_keyword': kwargs['topic'],
+        'secondary_keywords': ['Keyword A'],
+        'geo_keywords': ['What is Topic A?'],
+        'seo_report': {'seoScore': 8, 'geoScore': 8, 'improvementSuggestions': []},
+    })
 
     response = client.post(
         '/api/articles',
@@ -419,6 +489,9 @@ def test_generate_articles_endpoint_returns_articles(monkeypatch):
             'topics': ['Topic A'],
             'selected_topics': ['Topic A'],
             'article_count': 1,
+            'article_type': 'SEO Article',
+            'target_audience': 'Growth teams',
+            'source_context': 'A detailed source excerpt.',
         },
     )
 
@@ -426,6 +499,31 @@ def test_generate_articles_endpoint_returns_articles(monkeypatch):
     payload = response.json()
     assert payload['success'] is True
     assert payload['result']['articles'][0]['content'] == 'Article for Topic A'
+    assert payload['result']['articles'][0]['article_type'] == 'SEO Article'
+
+
+def test_export_article_endpoint_returns_txt_file():
+    response = client.post(
+        '/api/articles/export',
+        json={
+            'title': 'My Generated Article',
+            'topic': 'Topic A',
+            'content_html': '<h2>My Generated Article</h2><p>Body copy</p>',
+            'format': 'txt',
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('text/plain')
+    assert 'attachment; filename="my-generated-article.txt"' == response.headers['content-disposition']
+    assert 'My Generated Article' in response.text
+    assert 'Body copy' in response.text
+
+
+def test_map_public_error_message_hides_raw_codes():
+    message = map_public_error_message('RuntimeError: upstream failure 502 while contacting provider')
+    assert '502' not in message
+    assert 'RuntimeError' not in message
 
 
 def test_fallback_article_avoids_old_template_sections():

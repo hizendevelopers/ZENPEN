@@ -37,15 +37,28 @@ const appState = {
   session: null,
   authError: '',
   authMode: 'login',
+  authBusy: '',
+  authBusyMessage: '',
+  authForms: {
+    login: { email: '', password: '' },
+    signup: { name: '', email: '', password: '', confirmPassword: '' },
+  },
   analysisResult: null,
   analysisError: '',
   articleError: '',
+  publishError: '',
   busyMode: '',
   busyMessage: '',
+  exportBusy: '',
+  exportMessage: '',
+  successMessage: '',
+  sourceMode: 'url',
   formValues: {
     url: '',
     query: 'Give breaking news and main points',
     articleCount: '1',
+    articleType: 'Blog Article',
+    targetAudience: 'General readers',
   },
   lastSubmission: null,
   selectedTopics: [],
@@ -115,12 +128,21 @@ function getUserDisplayName(session = getSession()) {
 }
 
 function currentRoute() {
-  const hash = window.location.hash.replace(/^#/, '') || '/';
-  return hash.startsWith('/') ? hash : `/${hash}`;
+  return window.location.pathname || '/';
 }
 
-function navigate(path) {
-  window.location.hash = path;
+function navigate(path, { replace = false } = {}) {
+  const target = path.startsWith('/') ? path : `/${path}`;
+  if (window.location.pathname === target) {
+    renderApp();
+    return;
+  }
+  if (replace) {
+    window.history.replaceState({}, '', target);
+  } else {
+    window.history.pushState({}, '', target);
+  }
+  renderApp();
 }
 
 function isAuthenticated() {
@@ -128,6 +150,11 @@ function isAuthenticated() {
 }
 
 async function initializeApp() {
+  if (window.location.hash.startsWith('#/')) {
+    const migrated = window.location.hash.replace(/^#/, '');
+    window.history.replaceState({}, '', migrated);
+  }
+
   try {
     const response = await fetch('/api/config');
     if (response.ok) {
@@ -151,8 +178,9 @@ function resetGeneratorState() {
   appState.analysisResult = null;
   appState.analysisError = '';
   appState.articleError = '';
-  appState.busyMode = '';
-  appState.busyMessage = '';
+  appState.publishError = '';
+  appState.successMessage = '';
+  clearBusyStates();
   appState.selectedTopics = [];
   appState.lastSubmission = null;
 }
@@ -171,6 +199,69 @@ function stripHtmlToText(html) {
   return temp.textContent || temp.innerText || '';
 }
 
+function setPageMetadata(route) {
+  const metaByRoute = {
+    '/': {
+      title: 'ZENPEN | AI Article, Blog & Subtitle Workflows',
+      description: 'Turn videos, URLs, and uploads into polished articles, blogs, and subtitle-ready outputs with AI-assisted workflows.',
+    },
+    '/login': {
+      title: 'Login | ZENPEN',
+      description: 'Login to access your AI publishing workspace and continue your content workflow.',
+    },
+    '/signup': {
+      title: 'Sign Up | ZENPEN',
+      description: 'Create your ZENPEN account to analyze media and generate structured content.',
+    },
+    '/dashboard': {
+      title: 'Dashboard | ZENPEN',
+      description: 'Open your tools, manage outputs, and continue your content generation workflow.',
+    },
+    '/products/article-generator': {
+      title: 'Article Generator | ZENPEN',
+      description: 'Generate professional articles from YouTube videos, media uploads, and URLs with AI-assisted analysis.',
+    },
+  };
+  const fallback = {
+    title: 'ZENPEN',
+    description: 'AI-powered media analysis and publishing workflows.',
+  };
+  const meta = metaByRoute[route] || fallback;
+  document.title = meta.title;
+  let description = document.querySelector('meta[name="description"]');
+  if (!description) {
+    description = document.createElement('meta');
+    description.name = 'description';
+    document.head.appendChild(description);
+  }
+  description.setAttribute('content', meta.description);
+}
+
+function mapUserFacingError(error) {
+  const message = String(error?.message || error || '').trim();
+  const lower = message.toLowerCase();
+  if (!message) return 'Something went wrong. Please try again.';
+  if (lower.includes('passwords do not match')) return 'Passwords do not match. Please check them and try again.';
+  if (lower.includes('invalid email or password')) return 'We could not log you in with those details.';
+  if (lower.includes('please provide')) return 'Please provide a supported source before continuing.';
+  if (lower.includes('unsupported')) return 'That source type is not supported for this action.';
+  if (lower.includes('youtube video cannot be accessed')) return 'This YouTube video cannot be processed right now. Please try another source or upload the file.';
+  if (lower.includes('rate') && lower.includes('busy')) return 'The AI service is busy right now. Please retry in a moment.';
+  if (/\b\d{3}\b/.test(message) || lower.includes('traceback') || lower.includes('runtimeerror')) {
+    return 'We could not complete that request right now. Please try again.';
+  }
+  return message;
+}
+
+function clearBusyStates() {
+  appState.busyMode = '';
+  appState.busyMessage = '';
+  appState.authBusy = '';
+  appState.authBusyMessage = '';
+  appState.exportBusy = '';
+  appState.exportMessage = '';
+}
+
 function buildHeader() {
   const session = getSession();
   const authActions = session
@@ -182,14 +273,14 @@ function buildHeader() {
     `
     : `
       <div class="header-auth">
-        <a class="ghost-btn" href="#/login">Login</a>
-        <a class="primary-btn" href="#/signup">Sign Up</a>
+        <a class="ghost-btn" href="/login">Login</a>
+        <a class="primary-btn" href="/signup">Sign Up</a>
       </div>
     `;
 
   return `
     <header class="site-header">
-      <a class="brand-mark" href="#/${session ? 'dashboard' : ''}">
+      <a class="brand-mark" href="${session ? '/dashboard' : '/'}">
         <img class="brand-logo-image" src="/static/assets/zenpen-logo.png" alt="ZenPen logo" />
       </a>
       <nav class="top-nav">
@@ -197,16 +288,16 @@ function buildHeader() {
           <summary>Products</summary>
           <div class="dropdown-menu">
             ${PRODUCTS.map((product) => `
-              <a href="#/products/${product.slug}">
+              <a href="/products/${product.slug}">
                 <strong>${escapeHtml(product.title)}</strong>
                 <span>${escapeHtml(product.description)}</span>
               </a>
             `).join('')}
           </div>
         </details>
-        <a href="#/about">About Us</a>
-        <a href="#/blogs">Blogs</a>
-        <a href="#/contact">Contact Us</a>
+        <a href="/about">About Us</a>
+        <a href="/blogs">Blogs</a>
+        <a href="/contact">Contact Us</a>
       </nav>
       ${authActions}
     </header>
@@ -240,8 +331,8 @@ function buildLandingPage() {
           <span>Built for modern publishing teams</span>
         </div>
         <div class="hero-actions">
-          <a class="primary-btn" href="#/signup">Get Started</a>
-          <a class="ghost-btn" href="#/products/article-generator">Explore Products</a>
+          <a class="primary-btn" href="/signup">Get Started</a>
+          <a class="ghost-btn" href="/products/article-generator">Explore Products</a>
         </div>
         <div class="hero-trust-strip">
           <div>
@@ -269,6 +360,11 @@ function buildLandingPage() {
       </div>
       <div class="product-grid">
         ${PRODUCTS.map((product) => buildProductCard(product, !isAuthenticated())).join('')}
+      </div>
+      <div class="sample-preview">
+        <span class="eyebrow">Sample Output Preview</span>
+        <h3>What users can expect before generating</h3>
+        <p>A polished headline, cleaned summary, dynamic topic ideas, article-type-aware structure, SEO metadata, and export-ready content blocks.</p>
       </div>
     </section>
 
@@ -365,15 +461,15 @@ function buildFooter() {
       <div class="footer-links">
         <div>
           <span class="footer-title">Quick Links</span>
-          <a href="#/">Home</a>
-          <a href="#/about">About Us</a>
-          <a href="#/blogs">Blogs</a>
+          <a href="/">Home</a>
+          <a href="/about">About Us</a>
+          <a href="/blogs">Blogs</a>
         </div>
         <div>
           <span class="footer-title">Products</span>
-          <a href="#/products/article-generator">Article Generator</a>
-          <a href="#/products/blog-generator">Blog Generator</a>
-          <a href="#/products/srt-file-generator">.SRT File Generator</a>
+          <a href="/products/article-generator">Article Generator</a>
+          <a href="/products/blog-generator">Blog Generator</a>
+          <a href="/products/srt-file-generator">.SRT File Generator</a>
         </div>
         <div>
           <span class="footer-title">Contact</span>
@@ -393,9 +489,12 @@ function buildAuthPage(mode) {
     ? 'Login to access your products and continue generating content.'
     : 'Sign up to unlock the dashboard and start using the product suite.';
   const switchText = isLogin ? 'Need an account?' : 'Already have an account?';
-  const switchLink = isLogin ? '#/signup' : '#/login';
+  const switchLink = isLogin ? '/signup' : '/login';
   const switchLabel = isLogin ? 'Sign Up' : 'Login';
+  const busy = appState.authBusy === mode;
+  const formState = isLogin ? appState.authForms.login : appState.authForms.signup;
   const authError = appState.authError ? `<div class="state-banner error-state">${escapeHtml(appState.authError)}</div>` : '';
+  const authBusyBanner = busy ? `<div class="state-banner loading-state"><div class="loader small-loader"></div><span>${escapeHtml(appState.authBusyMessage || 'Working...')}</span></div>` : '';
 
   return `
     <section class="auth-shell">
@@ -403,29 +502,30 @@ function buildAuthPage(mode) {
         <span class="eyebrow">${isLogin ? 'Login' : 'Sign Up'}</span>
         <h1>${title}</h1>
         <p>${subtitle}</p>
+        ${authBusyBanner}
         ${authError}
         <form id="${isLogin ? 'login-form' : 'signup-form'}" class="auth-form">
           ${isLogin ? '' : `
             <label>
               Full Name
-              <input name="name" type="text" placeholder="Enter your full name" required />
+              <input name="name" type="text" placeholder="Enter your full name" value="${escapeHtml(formState.name || '')}" required />
             </label>
           `}
           <label>
             Email
-            <input name="email" type="email" placeholder="name@example.com" required />
+            <input name="email" type="email" placeholder="name@example.com" value="${escapeHtml(formState.email || '')}" required />
           </label>
           <label>
             Password
-            <input name="password" type="password" placeholder="Enter your password" required />
+            <input name="password" type="password" placeholder="Enter your password" value="${escapeHtml(formState.password || '')}" required />
           </label>
           ${isLogin ? '' : `
             <label>
               Confirm Password
-              <input name="confirmPassword" type="password" placeholder="Confirm your password" required />
+              <input name="confirmPassword" type="password" placeholder="Confirm your password" value="${escapeHtml(formState.confirmPassword || '')}" required />
             </label>
           `}
-          <button class="primary-btn wide-btn" type="submit">${isLogin ? 'Login' : 'Create Account'}</button>
+          <button class="primary-btn wide-btn" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Please wait...' : (isLogin ? 'Login' : 'Create Account')}</button>
         </form>
         <p class="auth-switch">${switchText} <a href="${switchLink}">${switchLabel}</a></p>
       </div>
@@ -455,8 +555,8 @@ function buildDashboard() {
           <span>Built for content teams</span>
         </div>
         <div class="hero-actions dashboard-actions">
-          <a class="primary-btn" href="#/products/article-generator">Open Article Generator</a>
-          <a class="ghost-btn" href="#/products/blog-generator">Explore Tools</a>
+          <a class="primary-btn" href="/products/article-generator">Open Article Generator</a>
+          <a class="ghost-btn" href="/products/blog-generator">Explore Tools</a>
         </div>
         <div class="dashboard-mini-points">
           <div>
@@ -484,7 +584,7 @@ function buildDashboard() {
 }
 
 function buildProductCard(product, requireLogin) {
-  const href = requireLogin ? '#/login' : `#/products/${product.slug}`;
+  const href = requireLogin ? '/login' : `/products/${product.slug}`;
   const productMeta = {
     'article-generator': {
       badge: 'AG',
@@ -559,7 +659,7 @@ function buildComingSoonPage(product) {
       <h1>${escapeHtml(product.title)}</h1>
       <p>${escapeHtml(product.description)}</p>
       <div class="state-banner empty-state">This product page is ready, but the full workflow is coming soon.</div>
-      <a class="ghost-btn" href="#/dashboard">Back to Dashboard</a>
+      <a class="ghost-btn" href="/dashboard">Back to Dashboard</a>
     </section>
   `;
 }
@@ -581,6 +681,7 @@ function buildAnalysisSummary() {
     <div class="analysis-result-card">
       <span class="eyebrow">Analysis Output</span>
       <h2>${escapeHtml(result.headline)}</h2>
+      ${result.topic_generation_warning ? `<div class="state-banner empty-state inline-state">${escapeHtml(result.topic_generation_warning)}</div>` : ''}
         <div class="summary-block">
           <h3>Summary</h3>
           <ul>
@@ -625,6 +726,20 @@ function buildTopicSelector() {
               </label>
             `).join('')}
           </div>
+        <div class="topic-actions two-row-actions">
+          <label>
+            Article type
+            <select id="article-type-input" name="article_type">
+              ${['Blog Article', 'News Article', 'How-to Guide', 'Listicle', 'Review', 'SEO Article'].map((type) => `
+                <option value="${escapeHtml(type)}" ${appState.formValues.articleType === type ? 'selected' : ''}>${escapeHtml(type)}</option>
+              `).join('')}
+            </select>
+          </label>
+          <label>
+            Target audience
+            <input id="target-audience-input" name="target_audience" type="text" value="${escapeHtml(appState.formValues.targetAudience)}" placeholder="General readers" />
+          </label>
+        </div>
         <div class="topic-actions">
           <label>
             Articles per topic
@@ -656,6 +771,9 @@ function buildArticlesSection() {
         </div>
         <button class="ghost-btn" data-action="download-all-articles">Download All</button>
       </div>
+      ${appState.exportMessage ? `<div class="state-banner loading-state inline-state"><div class="loader small-loader"></div><span>${escapeHtml(appState.exportMessage)}</span></div>` : ''}
+      ${appState.successMessage ? `<div class="state-banner loading-state inline-state">${escapeHtml(appState.successMessage)}</div>` : ''}
+      ${appState.publishError ? `<div class="state-banner error-state inline-state">${escapeHtml(appState.publishError)}</div>` : ''}
       <div class="articles-grid">
         ${articles.map((article, index) => `
           <article class="article-output-card">
@@ -666,13 +784,38 @@ function buildArticlesSection() {
                 <div class="article-card-header">
                   <div>
                     <span class="topic-tag">${escapeHtml(article.topic)}</span>
-                    <h4>${escapeHtml(appState.analysisResult.headline)}</h4>
+                    <h4>${escapeHtml(article.meta_title || appState.analysisResult.headline)}</h4>
                   </div>
                 <div class="article-actions">
-                  <button class="secondary-btn" data-action="copy-article" data-article-index="${index}">Copy</button>
-                  <button class="secondary-btn" data-action="download-article" data-article-index="${index}">Download</button>
+                  <button class="secondary-btn" data-action="copy-article" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>Copy</button>
+                  <button class="secondary-btn" data-action="copy-html" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>Copy HTML</button>
+                  <button class="secondary-btn" data-action="download-article" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>TXT</button>
+                  <button class="secondary-btn" data-action="download-docx" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>DOCX</button>
+                  <button class="secondary-btn" data-action="download-pdf" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>PDF</button>
+                  <button class="secondary-btn" data-action="publish-draft" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>Publish Draft</button>
                 </div>
               </div>
+                <div class="article-meta-grid">
+                  <div><strong>Article Type</strong><span>${escapeHtml(article.article_type || appState.formValues.articleType)}</span></div>
+                  <div><strong>Slug</strong><span>${escapeHtml(article.slug || '')}</span></div>
+                  <div><strong>Focus Keyword</strong><span>${escapeHtml(article.focus_keyword || article.topic)}</span></div>
+                  <div><strong>Meta Description</strong><span>${escapeHtml(article.meta_description || '')}</span></div>
+                  <div><strong>Secondary Keywords</strong><span>${escapeHtml((article.secondary_keywords || []).join(', '))}</span></div>
+                  <div><strong>GEO Keywords</strong><span>${escapeHtml((article.geo_keywords || []).join(', '))}</span></div>
+                </div>
+                ${article.seo_report ? `
+                  <div class="score-card">
+                    <div class="score-strip">
+                      <span><strong>SEO</strong> ${article.seo_report.seoScore}/10</span>
+                      <span><strong>GEO</strong> ${article.seo_report.geoScore}/10</span>
+                    </div>
+                    ${(article.seo_report.improvementSuggestions || []).length ? `
+                      <ul class="score-suggestions">
+                        ${(article.seo_report.improvementSuggestions || []).map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
+                      </ul>
+                    ` : '<p class="score-pass">The article passed the current SEO/GEO checks cleanly.</p>'}
+                  </div>
+                ` : ''}
                 <div class="article-content">${article.content || ''}</div>
               </div>
             </article>
@@ -683,34 +826,52 @@ function buildArticlesSection() {
 }
 
 function buildArticleGeneratorPage() {
+  const uploadMode = appState.sourceMode === 'upload';
   return `
     <section class="generator-hero">
       <div>
         <span class="eyebrow">Product Page</span>
         <h1>Article Generator</h1>
-        <p>Enter a URL or upload a video file, analyze the content, then generate topic-specific articles.</p>
+        <p>Enter a webpage or YouTube URL, or upload an audio/video file, then generate topic-specific articles in the format you need.</p>
       </div>
-      <a class="ghost-btn" href="#/dashboard">Back to Dashboard</a>
+      <a class="ghost-btn" href="/dashboard">Back to Dashboard</a>
     </section>
 
     <section class="generator-grid">
       <div class="panel analysis-form-panel">
         <h2>Step 1: Analyze Source Content</h2>
+        <div class="sample-preview">
+          <span class="eyebrow">Sample Preview</span>
+          <h3>What the output looks like</h3>
+          <p>A cleaned headline, dynamic topics, article-type-aware writing, SEO metadata, and export-ready content.</p>
+        </div>
         <form id="article-generator-form" class="product-form">
+          <div class="source-mode-group">
+            <label class="mode-chip">
+              <input type="radio" name="source_mode" value="url" ${!uploadMode ? 'checked' : ''} />
+              <span>Paste URL</span>
+            </label>
+            <label class="mode-chip">
+              <input type="radio" name="source_mode" value="upload" ${uploadMode ? 'checked' : ''} />
+              <span>Upload audio/video</span>
+            </label>
+          </div>
           <label>
             Enter a URL
-            <input id="url-input" name="url" type="url" placeholder="https://www.youtube.com/watch?v=..." value="${escapeHtml(appState.formValues.url)}" />
+            <input id="url-input" name="url" type="url" placeholder="https://example.com/article or https://www.youtube.com/watch?v=..." value="${escapeHtml(appState.formValues.url)}" ${uploadMode ? 'disabled' : ''} />
           </label>
           <div class="or-divider">or</div>
           <label>
-            Upload a video file
-            <input id="file-input" name="file" type="file" accept="video/mp4,video/mov,video/avi,video/webm,video/mkv" />
+            Upload an audio or video file
+            <input id="file-input" name="file" type="file" accept="audio/*,video/*" ${uploadMode ? '' : 'disabled'} />
+            <span class="field-helper">${uploadMode ? 'Audio and video uploads are enabled.' : 'Select the upload mode to enable file selection.'}</span>
           </label>
           <label>
             Analysis prompt
             <input id="query-input" name="query" type="text" value="${escapeHtml(appState.formValues.query)}" />
           </label>
           <button class="primary-btn wide-btn" type="submit" ${appState.busyMode === 'analyzing' ? 'disabled' : ''}>Analyze Content</button>
+          <p class="field-helper">Supported direct inputs: webpages, article URLs, YouTube/video links, and uploaded audio/video files. Image URLs are not supported yet.</p>
         </form>
       </div>
 
@@ -759,9 +920,10 @@ function renderApp() {
   }
 
   const route = currentRoute();
+  setPageMetadata(route);
   const protectedRoutes = route === '/dashboard' || route.startsWith('/products/');
   if (protectedRoutes && !isAuthenticated()) {
-    navigate('/login');
+    navigate('/login', { replace: true });
     return;
   }
 
@@ -774,8 +936,10 @@ function renderApp() {
   `;
 }
 
-function validateAnalysisInput(url, file) {
-  if (!url && !file) return 'Please provide a URL or upload a video file.';
+function validateAnalysisInput(url, file, sourceMode) {
+  if (sourceMode === 'upload' && !file) return 'Please choose an audio or video file to upload.';
+  if (sourceMode !== 'upload' && !url) return 'Please provide a valid URL to analyze.';
+  if (!url && !file) return 'Please provide a URL or upload an audio/video file.';
   if (url) {
     try {
       new URL(url);
@@ -783,8 +947,8 @@ function validateAnalysisInput(url, file) {
       return 'Please enter a valid URL.';
     }
   }
-  if (file && !file.type.startsWith('video/')) {
-    return 'Unsupported video format. Please upload a valid video file.';
+  if (file && file.type && !file.type.startsWith('video/') && !file.type.startsWith('audio/')) {
+    return 'Unsupported file format. Please upload a valid audio or video file.';
   }
   return '';
 }
@@ -799,31 +963,45 @@ function buildAuthHeaders() {
 }
 
 async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 180000);
   const formData = new FormData();
   if (source.url) formData.append('url', source.url);
   if (source.query) formData.append('query', source.query);
   if (source.file) formData.append('file', source.file);
   formData.append('generate_article', generateArticle ? 'true' : 'false');
   formData.append('article_count', appState.formValues.articleCount || '1');
+  formData.append('article_type', appState.formValues.articleType || 'Blog Article');
+  formData.append('target_audience', appState.formValues.targetAudience || 'General readers');
   if (selectedTopics?.length) formData.append('selected_topics', selectedTopics.join(','));
 
-  const response = await fetch('/api/analyze', {
-    method: 'POST',
-    headers: buildAuthHeaders(),
-    body: formData,
-  });
-  const responseText = await response.text();
-  let payload = null;
   try {
-    payload = responseText ? JSON.parse(responseText) : null;
-  } catch {
-    payload = null;
+    const response = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: buildAuthHeaders(),
+      body: formData,
+      signal: controller.signal,
+    });
+    const responseText = await response.text();
+    let payload = null;
+    try {
+      payload = responseText ? JSON.parse(responseText) : null;
+    } catch {
+      payload = null;
+    }
+    if (!response.ok || !payload?.success) {
+      const message = payload?.error || payload?.detail || responseText || 'Request failed.';
+      throw new Error(mapUserFacingError(message));
+    }
+    return payload;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('The analysis took too long. Please try again with a shorter source or retry in a moment.');
+    }
+    throw new Error(mapUserFacingError(error));
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!response.ok || !payload.success) {
-    const message = payload?.error || payload?.detail || responseText || 'Request failed.';
-    throw new Error(message);
-  }
-  return payload;
 }
 
 async function sendGenerateArticlesRequest({ headline, summary, topics, selectedTopics, articleCount }) {
@@ -839,37 +1017,110 @@ async function sendGenerateArticlesRequest({ headline, summary, topics, selected
       topics,
       selected_topics: selectedTopics,
       article_count: Number(articleCount || 1),
+      article_type: appState.formValues.articleType || 'Blog Article',
+      target_audience: appState.formValues.targetAudience || 'General readers',
+      source_context: appState.analysisResult?.source_context_preview || appState.analysisResult?.summary || '',
     }),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.success) {
-    throw new Error(payload?.detail || payload?.error || 'Article generation failed.');
+    throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Article generation failed.'));
   }
   return payload.result;
 }
 
 async function sendAuthRequest(path, payload) {
-  const response = await fetch(path, {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+  try {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.success) {
+      throw new Error(mapUserFacingError(data.detail || data.error || 'Authentication request failed.'));
+    }
+    return data.session;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('The request timed out. Please try again.');
+    }
+    throw new Error(mapUserFacingError(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function exportArticle(article, format) {
+  const response = await fetch('/api/articles/export', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...buildAuthHeaders(),
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      title: article.meta_title || appState.analysisResult?.headline || article.topic,
+      topic: article.topic,
+      content_html: article.content || '',
+      format,
+    }),
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.success) {
-    throw new Error(data.detail || data.error || 'Authentication request failed.');
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Export failed.'));
   }
-  return data.session;
+  const blob = await response.blob();
+  const downloadUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = downloadUrl;
+  link.download = `${(article.slug || article.topic || 'generated-article').replace(/[^a-z0-9-]+/gi, '-')}.${format}`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(downloadUrl);
+}
+
+async function publishArticleDraft(article) {
+  const response = await fetch('/api/articles/publish', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...buildAuthHeaders(),
+    },
+    body: JSON.stringify({
+      headline: appState.analysisResult?.headline || article.meta_title || article.topic,
+      summary: appState.analysisResult?.summary || '',
+      topics: appState.analysisResult?.topics || [],
+      selected_topics: [article.topic],
+      articles: [article],
+      source_type: appState.lastSubmission?.file ? 'upload' : 'url',
+      source_url: appState.lastSubmission?.url || null,
+      source_file_name: appState.lastSubmission?.file?.name || null,
+      source_mime_type: appState.lastSubmission?.file?.type || null,
+      query: appState.formValues.query || 'Give breaking news and main points',
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.success) {
+    throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Draft publishing failed.'));
+  }
+  return payload;
 }
 
 async function handleAnalyzeSubmit(form) {
+  if (appState.busyMode === 'analyzing') return;
   const fileInput = form.querySelector('#file-input');
+  const sourceMode = form.querySelector('input[name="source_mode"]:checked')?.value || 'url';
   const url = form.querySelector('#url-input').value.trim();
   const query = form.querySelector('#query-input').value.trim() || 'Give breaking news and main points';
   const file = fileInput?.files?.[0] || null;
 
-  const validationMessage = validateAnalysisInput(url, file);
+  const validationMessage = validateAnalysisInput(url, file, sourceMode);
   if (validationMessage) {
     appState.analysisError = validationMessage;
     appState.articleError = '';
@@ -877,12 +1128,17 @@ async function handleAnalyzeSubmit(form) {
     return;
   }
 
+  appState.sourceMode = sourceMode;
   appState.formValues.url = url;
   appState.formValues.query = query;
   appState.analysisError = '';
   appState.articleError = '';
+  appState.publishError = '';
+  appState.successMessage = '';
   appState.busyMode = 'analyzing';
-  appState.busyMessage = 'Analyzing your URL or uploaded video...';
+  appState.busyMessage = sourceMode === 'upload'
+    ? 'Uploading and extracting content from your file...'
+    : 'Fetching source, extracting content, and analyzing topics...';
   renderApp();
 
     try {
@@ -892,18 +1148,17 @@ async function handleAnalyzeSubmit(form) {
       const result = payload.result;
       appState.analysisResult = result;
       appState.selectedTopics = result.topics ? result.topics.slice(0, 3) : [];
-      appState.busyMode = '';
-      appState.busyMessage = '';
+      clearBusyStates();
       renderApp();
     } catch (error) {
-      appState.analysisError = error.message;
-      appState.busyMode = '';
-      appState.busyMessage = '';
+      appState.analysisError = mapUserFacingError(error);
+      clearBusyStates();
       renderApp();
   }
 }
 
 async function handleArticleGeneration(form) {
+  if (appState.busyMode === 'articles') return;
   if (!appState.analysisResult) {
     appState.articleError = 'Analyze content first before generating articles.';
     renderApp();
@@ -919,9 +1174,13 @@ async function handleArticleGeneration(form) {
 
   appState.selectedTopics = selectedTopics;
   appState.formValues.articleCount = form.querySelector('#article-count-input').value || '1';
+  appState.formValues.articleType = form.querySelector('#article-type-input').value || 'Blog Article';
+  appState.formValues.targetAudience = form.querySelector('#target-audience-input').value.trim() || 'General readers';
   appState.articleError = '';
+  appState.publishError = '';
+  appState.successMessage = '';
   appState.busyMode = 'articles';
-  appState.busyMessage = 'Generating full articles for your selected topics...';
+  appState.busyMessage = `Generating a ${appState.formValues.articleType.toLowerCase()} for your selected topics...`;
   renderApp();
 
   try {
@@ -933,31 +1192,38 @@ async function handleArticleGeneration(form) {
       articleCount: appState.formValues.articleCount,
     });
     appState.analysisResult = result;
-    appState.busyMode = '';
-    appState.busyMessage = '';
+    clearBusyStates();
     renderApp();
   } catch (error) {
-    appState.articleError = error.message;
-    appState.busyMode = '';
-    appState.busyMessage = '';
+    appState.articleError = mapUserFacingError(error);
+    clearBusyStates();
     renderApp();
   }
 }
 
 async function handleLoginSubmit(form) {
+  if (appState.authBusy === 'login') return;
   const formData = new FormData(form);
   const email = String(formData.get('email') || '').trim().toLowerCase();
   const password = String(formData.get('password') || '');
+  appState.authForms.login = { email, password };
+  appState.authBusy = 'login';
+  appState.authBusyMessage = 'Signing you in...';
+  appState.authError = '';
+  renderApp();
 
   if (hasSupabaseAuth()) {
     try {
       const session = await sendAuthRequest('/api/auth/login', { email, password });
       setSession(session);
       appState.authError = '';
+      clearBusyStates();
+      appState.authForms.login = { email: '', password: '' };
       navigate('/dashboard');
       return;
     } catch (error) {
-      appState.authError = error.message || 'Invalid email or password.';
+      appState.authError = mapUserFacingError(error) || 'Invalid email or password.';
+      clearBusyStates();
       renderApp();
       return;
     }
@@ -967,20 +1233,25 @@ async function handleLoginSubmit(form) {
   const user = users.find((item) => item.email === email && item.password === password);
   if (!user) {
     appState.authError = 'Invalid email or password.';
+    clearBusyStates();
     renderApp();
     return;
   }
   setSession({ name: user.name, email: user.email });
   appState.authError = '';
+  clearBusyStates();
+  appState.authForms.login = { email: '', password: '' };
   navigate('/dashboard');
 }
 
 async function handleSignupSubmit(form) {
+  if (appState.authBusy === 'signup') return;
   const formData = new FormData(form);
   const name = String(formData.get('name') || '').trim();
   const email = String(formData.get('email') || '').trim().toLowerCase();
   const password = String(formData.get('password') || '');
   const confirmPassword = String(formData.get('confirmPassword') || '');
+  appState.authForms.signup = { name, email, password, confirmPassword };
 
   if (!name || !email || !password) {
     appState.authError = 'All fields are required.';
@@ -988,20 +1259,28 @@ async function handleSignupSubmit(form) {
     return;
   }
   if (password !== confirmPassword) {
-    appState.authError = 'Passwords do not match.';
+    appState.authError = 'Passwords do not match. Please recheck both password fields.';
     renderApp();
     return;
   }
+
+  appState.authBusy = 'signup';
+  appState.authBusyMessage = 'Creating your account...';
+  appState.authError = '';
+  renderApp();
 
   if (hasSupabaseAuth()) {
     try {
       const session = await sendAuthRequest('/api/auth/signup', { name, email, password });
       setSession(session);
       appState.authError = '';
+      clearBusyStates();
+      appState.authForms.signup = { name: '', email: '', password: '', confirmPassword: '' };
       navigate('/dashboard');
       return;
     } catch (error) {
-      appState.authError = error.message || 'Could not create your account.';
+      appState.authError = mapUserFacingError(error) || 'Could not create your account.';
+      clearBusyStates();
       renderApp();
       return;
     }
@@ -1010,6 +1289,7 @@ async function handleSignupSubmit(form) {
   const users = getUsers();
   if (users.some((user) => user.email === email)) {
     appState.authError = 'An account with this email already exists.';
+    clearBusyStates();
     renderApp();
     return;
   }
@@ -1018,6 +1298,8 @@ async function handleSignupSubmit(form) {
   saveUsers(users);
   setSession({ name, email });
   appState.authError = '';
+  clearBusyStates();
+  appState.authForms.signup = { name: '', email: '', password: '', confirmPassword: '' };
   navigate('/dashboard');
 }
 
@@ -1039,6 +1321,27 @@ async function copyArticle(article, index) {
 }
 
 function attachDelegatedHandlers() {
+  document.addEventListener('change', (event) => {
+    if (event.target.name === 'source_mode') {
+      appState.sourceMode = event.target.value;
+      renderApp();
+      return;
+    }
+  });
+
+  document.addEventListener('input', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    const form = target.form;
+    if (!form) return;
+    if (form.id === 'login-form') {
+      appState.authForms.login[target.name] = target.value;
+    }
+    if (form.id === 'signup-form') {
+      appState.authForms.signup[target.name] = target.value;
+    }
+  });
+
   document.addEventListener('submit', (event) => {
     if (event.target.id === 'login-form') {
       event.preventDefault();
@@ -1059,6 +1362,17 @@ function attachDelegatedHandlers() {
   });
 
   document.addEventListener('click', async (event) => {
+    const link = event.target.closest('a[href]');
+    if (link) {
+      const href = link.getAttribute('href') || '';
+      if (href.startsWith('/') && !href.startsWith('//')) {
+        event.preventDefault();
+        clearBusyStates();
+        navigate(href);
+        return;
+      }
+    }
+
     const button = event.target.closest('[data-action]');
     if (!button) return;
 
@@ -1075,6 +1389,8 @@ function attachDelegatedHandlers() {
           .map((article, index) => `Article ${index + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`)
           .join('\n\n' + '-'.repeat(80) + '\n\n');
         downloadTextFile('generated-articles.txt', payload);
+        appState.successMessage = 'All generated articles were downloaded.';
+        renderApp();
         return;
       }
 
@@ -1083,6 +1399,8 @@ function attachDelegatedHandlers() {
       const article = appState.analysisResult?.articles?.[articleIndex];
       if (!article) return;
       await copyArticle(article, articleIndex);
+      appState.successMessage = 'Article content copied to clipboard.';
+      renderApp();
       return;
     }
 
@@ -1092,21 +1410,75 @@ function attachDelegatedHandlers() {
         if (!article) return;
         const safeTopic = article.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `article-${articleIndex + 1}`;
         downloadTextFile(`${safeTopic}.txt`, `Article ${articleIndex + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`);
+        appState.successMessage = 'TXT export is ready.';
+        renderApp();
+        return;
+      }
+
+      if (button.dataset.action === 'copy-html') {
+        const articleIndex = Number(button.dataset.articleIndex);
+        const article = appState.analysisResult?.articles?.[articleIndex];
+        if (!article) return;
+        await navigator.clipboard.writeText(article.content || '');
+        appState.successMessage = 'HTML copied to clipboard.';
+        renderApp();
+        return;
+      }
+
+      if (button.dataset.action === 'download-docx' || button.dataset.action === 'download-pdf') {
+        const articleIndex = Number(button.dataset.articleIndex);
+        const article = appState.analysisResult?.articles?.[articleIndex];
+        if (!article) return;
+        appState.exportBusy = button.dataset.action;
+        appState.exportMessage = 'Preparing your export...';
+        appState.publishError = '';
+        renderApp();
+        try {
+          await exportArticle(article, button.dataset.action === 'download-docx' ? 'docx' : 'pdf');
+          appState.successMessage = `${button.dataset.action === 'download-docx' ? 'DOCX' : 'PDF'} export is ready.`;
+        } catch (error) {
+          appState.publishError = mapUserFacingError(error);
+        } finally {
+          appState.exportBusy = '';
+          appState.exportMessage = '';
+          renderApp();
+        }
+        return;
+      }
+
+      if (button.dataset.action === 'publish-draft') {
+        const articleIndex = Number(button.dataset.articleIndex);
+        const article = appState.analysisResult?.articles?.[articleIndex];
+        if (!article) return;
+        appState.exportBusy = 'publish';
+        appState.exportMessage = 'Saving your draft...';
+        appState.publishError = '';
+        renderApp();
+        try {
+          await publishArticleDraft(article);
+          appState.successMessage = 'Draft saved successfully.';
+        } catch (error) {
+          appState.publishError = mapUserFacingError(error);
+        } finally {
+          appState.exportBusy = '';
+          appState.exportMessage = '';
+          renderApp();
+        }
       }
   });
 }
 
-window.addEventListener('hashchange', () => {
+attachDelegatedHandlers();
+window.addEventListener('popstate', () => {
+  clearBusyStates();
   const route = currentRoute();
   if (!route.startsWith('/products/article-generator')) {
     resetGeneratorState();
   }
   renderApp();
 });
-
-attachDelegatedHandlers();
-if (!window.location.hash) {
-  navigate('/');
+if (!window.location.pathname) {
+  navigate('/', { replace: true });
 }
 renderApp();
 initializeApp();

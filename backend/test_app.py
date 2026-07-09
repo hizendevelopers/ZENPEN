@@ -3,6 +3,7 @@ import io
 from fastapi.testclient import TestClient
 
 from app import (
+    ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
     analyze_text_content,
     app,
     analyze_url_source,
@@ -429,6 +430,32 @@ def test_analyze_url_source_uses_real_webpage_content(monkeypatch):
     assert result['source_context_preview']
 
 
+def test_analyze_url_source_fails_fast_when_youtube_text_is_unavailable(monkeypatch):
+    monkeypatch.setattr('app.ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK', False)
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
+    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('no subtitles')))
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
+
+    try:
+        analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
+    except RuntimeError as exc:
+        assert 'could not provide transcript or subtitle text quickly enough' in str(exc)
+    else:
+        raise AssertionError('Expected RuntimeError')
+
+
+def test_build_topic_details_bundle_deduplicates_titles(monkeypatch):
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'One', 'importance': 'Alpha'},
+        {'title': 'Topic A', 'explanation': 'Two', 'importance': 'Beta'},
+        {'title': 'Topic B', 'explanation': 'Three', 'importance': 'Gamma'},
+    ])
+    from app import build_topic_details_bundle
+
+    details, _ = build_topic_details_bundle('- point 1')
+    assert [item['title'] for item in details] == ['Topic A', 'Topic B']
+
+
 def test_analyze_endpoint_stays_synchronous_even_if_queue_is_available(monkeypatch):
     monkeypatch.setattr('app.background_url_jobs_available', lambda: True)
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
@@ -524,6 +551,11 @@ def test_map_public_error_message_hides_raw_codes():
     message = map_public_error_message('RuntimeError: upstream failure 502 while contacting provider')
     assert '502' not in message
     assert 'RuntimeError' not in message
+
+
+def test_map_public_error_message_handles_site_block():
+    message = map_public_error_message('That website blocked direct content extraction. Please try another public URL or upload the media file.')
+    assert 'blocked direct content extraction' in message
 
 
 def test_fallback_article_avoids_old_template_sections():

@@ -69,6 +69,7 @@ FAST_ANALYSIS_MODE = os.getenv("FAST_ANALYSIS_MODE", "true").strip().lower() not
 FAST_ANALYSIS_TRANSCRIPT_LIMIT = int(os.getenv("FAST_ANALYSIS_TRANSCRIPT_LIMIT", "5000"))
 FAST_ANALYSIS_CHUNK_LIMIT = int(os.getenv("FAST_ANALYSIS_CHUNK_LIMIT", "6"))
 ENABLE_BACKGROUND_URL_JOBS = os.getenv("ENABLE_BACKGROUND_URL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK = os.getenv("ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_BACKOFF_UNTIL = 0.0
 
 WHISPER_MODEL = None
@@ -204,6 +205,7 @@ def dependency_status() -> dict[str, bool | str]:
         "redis_queue_configured": queue_is_configured(),
         "redis_queue_available": queue_is_available(),
         "background_url_jobs_enabled": ENABLE_BACKGROUND_URL_JOBS,
+        "remote_media_download_fallback_enabled": ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
         "youtube_proxy_configured": bool(get_proxy_url("http") or get_proxy_url("https")),
     }
 
@@ -999,19 +1001,29 @@ def clean_source_text(text: str) -> str:
 
 def extract_webpage_content(url: str) -> dict[str, object]:
     BeautifulSoup = get_beautiful_soup_class()
-    response = httpx.get(
-        url,
-        timeout=20.0,
-        follow_redirects=True,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/127.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    response.raise_for_status()
+    try:
+        response = httpx.get(
+            url,
+            timeout=20.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/127.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code in {401, 403}:
+            raise RuntimeError("That website blocked direct content extraction. Please try another public URL or upload the media file.") from exc
+        if status_code == 404:
+            raise RuntimeError("That URL could not be found. Please check the link and try again.") from exc
+        raise RuntimeError("We could not fetch readable content from that URL right now. Please try another source.") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError("We could not fetch readable content from that URL right now. Please try another source.") from exc
     content_type = response.headers.get("content-type", "").lower()
     if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
         raise RuntimeError("Only webpage URLs are supported for direct link analysis right now.")
@@ -1053,7 +1065,22 @@ def extract_webpage_content(url: str) -> dict[str, object]:
 
 
 def build_topic_details_bundle(summary_text: str) -> tuple[list[dict[str, str]], bool]:
-    details = get_topic_details_from_summary(summary_text)
+    raw_details = get_topic_details_from_summary(summary_text)
+    details: list[dict[str, str]] = []
+    seen_titles: set[str] = set()
+    for item in raw_details:
+        title = clean_topic_title(str(item.get("title", "")))
+        key = title.lower()
+        if not title or key in seen_titles:
+            continue
+        seen_titles.add(key)
+        details.append(
+            {
+                "title": title,
+                "explanation": sanitize_inline_html(str(item.get("explanation", ""))),
+                "importance": sanitize_inline_html(str(item.get("importance", ""))),
+            }
+        )
     used_fallback = all(title_needs_editorial_rewrite(item.get("title", "")) for item in details[: min(3, len(details))]) if details else True
     return details, used_fallback
 
@@ -2354,6 +2381,11 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
                 try:
                     transcript_override = fetch_youtube_subtitles_text(url, temp_dir)
                 except Exception as subtitle_exc:
+                    if not ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK:
+                        raise RuntimeError(
+                            "This YouTube video could not provide transcript or subtitle text quickly enough. "
+                            "Please try another video or upload the audio/video file directly for full transcription."
+                        ) from subtitle_exc
                     try:
                         temp_audio_path = download_audio(url, temp_dir)
                     except Exception as download_exc:
@@ -2368,6 +2400,8 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
                         f"YouTube subtitle fallback failed: {subtitle_exc}"
                     ) from subtitle_exc
         else:
+            if not ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK:
+                raise RuntimeError("Direct remote media downloads are disabled in fast mode. Please upload the audio/video file instead.")
             temp_audio_path = download_audio(url, temp_dir)
 
         if transcript_override is not None:

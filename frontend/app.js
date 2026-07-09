@@ -67,6 +67,7 @@ const appState = {
 };
 
 let analysisPollTimer = null;
+let busyStatusTimer = null;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -270,6 +271,43 @@ function stopAnalysisPolling() {
   appState.activeJobStage = '';
 }
 
+function stopBusyStatusTimer() {
+  if (busyStatusTimer) {
+    clearTimeout(busyStatusTimer);
+    busyStatusTimer = null;
+  }
+}
+
+function startBusyStatusTimer(mode) {
+  stopBusyStatusTimer();
+  const stagesByMode = {
+    analyzing: [
+      { delay: 12000, message: 'Preparing source and extracting usable content...' },
+      { delay: 22000, message: 'This is taking longer than usual. We are optimizing the article from your source.' },
+    ],
+    articles: [
+      { delay: 8000, message: 'Generating article draft from your source...' },
+      { delay: 16000, message: 'Refining output and checking article quality...' },
+      { delay: 26000, message: 'This is taking longer than usual. We are optimizing the article from your source.' },
+    ],
+  };
+  const stages = stagesByMode[mode] || [];
+  let index = 0;
+  const scheduleNext = () => {
+    const stage = stages[index];
+    if (!stage) return;
+    busyStatusTimer = setTimeout(() => {
+      if (appState.busyMode === mode) {
+        appState.busyMessage = stage.message;
+        renderApp();
+      }
+      index += 1;
+      scheduleNext();
+    }, stage.delay);
+  };
+  scheduleNext();
+}
+
 function clearBusyStates() {
   appState.busyMode = '';
   appState.busyMessage = '';
@@ -277,6 +315,7 @@ function clearBusyStates() {
   appState.authBusyMessage = '';
   appState.exportBusy = '';
   appState.exportMessage = '';
+  stopBusyStatusTimer();
   stopAnalysisPolling();
 }
 
@@ -1023,28 +1062,41 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
 }
 
 async function sendGenerateArticlesRequest({ headline, summary, topics, selectedTopics, articleCount }) {
-  const response = await fetch('/api/articles', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...buildAuthHeaders(),
-    },
-    body: JSON.stringify({
-      headline,
-      summary,
-      topics,
-      selected_topics: selectedTopics,
-      article_count: Number(articleCount || 1),
-      article_type: appState.formValues.articleType || 'Blog Article',
-      target_audience: appState.formValues.targetAudience || 'General readers',
-      source_context: appState.analysisResult?.source_context_preview || appState.analysisResult?.summary || '',
-    }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || !payload.success) {
-    throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Article generation failed.'));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await fetch('/api/articles', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({
+        headline,
+        summary,
+        topics,
+        selected_topics: selectedTopics,
+        article_count: Number(articleCount || 1),
+        article_type: appState.formValues.articleType || 'Blog Article',
+        target_audience: appState.formValues.targetAudience || 'General readers',
+        source_context: appState.analysisResult?.source_context_preview || appState.analysisResult?.summary || '',
+        source_cache_key: appState.analysisResult?.source_cache_key || '',
+      }),
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.success) {
+      throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Article generation failed.'));
+    }
+    return payload.result;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('This is taking longer than usual. We are optimizing the article from your source.');
+    }
+    throw new Error(mapUserFacingError(error));
+  } finally {
+    clearTimeout(timeout);
   }
-  return payload.result;
 }
 
 async function fetchAnalysisJob(jobId) {
@@ -1205,6 +1257,7 @@ async function handleAnalyzeSubmit(form) {
   appState.busyMessage = sourceMode === 'upload'
     ? 'Uploading your media and preparing transcription...'
     : 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
+  startBusyStatusTimer('analyzing');
   renderApp();
 
     try {
@@ -1255,6 +1308,7 @@ async function handleArticleGeneration(form) {
   appState.successMessage = '';
   appState.busyMode = 'articles';
   appState.busyMessage = `Generating a ${appState.formValues.articleType.toLowerCase()} for your selected topics...`;
+  startBusyStatusTimer('articles');
   renderApp();
 
   try {

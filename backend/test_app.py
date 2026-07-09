@@ -7,20 +7,26 @@ from app import (
     analyze_text_content,
     app,
     analyze_url_source,
+    build_chunk_safe_analysis_input,
+    build_content_cache_key,
     build_dynamic_subheadings,
     download_audio,
     extract_youtube_video_id,
+    extract_webpage_content,
     fallback_article,
     fetch_youtube_transcript_text,
     find_http_urls_in_payload,
     build_local_topic_details,
+    generate_article_html,
     get_topic_details_from_summary,
     map_public_error_message,
+    save_cached_source_content,
     sanitize_article_html,
     is_youtube_url,
     select_any_non_youtube_url,
     select_apify_download_url,
     select_best_audio_format_id,
+    transcribe_audio_with_fallback,
 )
 
 client = TestClient(app)
@@ -178,6 +184,69 @@ def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp
         assert 'Apify YouTube download failed' in str(exc)
     else:
         raise AssertionError('Expected RuntimeError')
+
+
+def test_transcribe_audio_with_fallback_uses_cached_transcript(monkeypatch):
+    monkeypatch.setattr('app.load_cached_transcript', lambda cache_key: 'cached transcript ready')
+    monkeypatch.setattr('app.split_audio_for_transcription', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not split audio')))
+
+    transcript = transcribe_audio_with_fallback('demo.wav', cache_key='cached-key')
+
+    assert transcript == 'cached transcript ready'
+
+
+def test_build_chunk_safe_analysis_input_reuses_summary_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.SUMMARY_CACHE_DIR', tmp_path)
+    monkeypatch.setattr('app.LONG_TRANSCRIPT_THRESHOLD', 10)
+    calls = {'count': 0}
+
+    def fake_generate_text(prompt):
+        calls['count'] += 1
+        return '- cached point'
+
+    monkeypatch.setattr('app.gemini_generate_text', fake_generate_text)
+    transcript = 'This is the first sentence. This is the second sentence. This is the third sentence. This is the fourth sentence.'
+
+    first = build_chunk_safe_analysis_input(transcript, 'Summarize')
+    second = build_chunk_safe_analysis_input(transcript, 'Summarize')
+
+    assert first == second
+    assert calls['count'] >= 1
+    assert calls['count'] <= len(first.splitlines())
+
+
+def test_extract_webpage_content_uses_cached_source(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.SOURCE_CACHE_DIR', tmp_path)
+    cache_key = build_content_cache_key('webpage', 'https://example.com/story')
+    cached_payload = {
+        'title': 'Cached title',
+        'meta_description': 'Cached description',
+        'headings': ['Cached heading'],
+        'content': 'Cached readable content from the article body that is definitely long enough for extraction.',
+    }
+    save_cached_source_content(cache_key, cached_payload)
+    monkeypatch.setattr('app.httpx.get', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('network should not run')))
+
+    payload = extract_webpage_content('https://example.com/story')
+
+    assert payload == cached_payload
+
+
+def test_generate_article_html_skips_proofread_in_fast_mode(monkeypatch):
+    monkeypatch.setattr('app.ENABLE_DEEP_ARTICLE_REFINEMENT', False)
+    monkeypatch.setattr('app.gemini_generate_text', lambda prompt: '<h2>Headline</h2><h3>Section</h3><p>Body paragraph one.</p><h3>More</h3><p>Body paragraph two.</p><h3>End</h3><p>Body paragraph three.</p>')
+    monkeypatch.setattr('app.proofread_article_html', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('proofread should be skipped')))
+
+    html = generate_article_html(
+        headline_text='Headline',
+        summary_text='- Point one\n- Point two\n- Point three',
+        topic='Fast Path',
+        article_type='Blog Article',
+        source_context='This source context explains the topic with enough detail for testing.',
+        target_audience='General readers',
+    )
+
+    assert '<h2>Headline</h2>' in html
 
 
 def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):

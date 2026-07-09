@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from html import unescape
@@ -41,6 +44,8 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 HISTORY_FILE = BASE_DIR / "backend" / "history.json"
 WHISPER_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "whisper"
 TRANSCRIPT_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "transcripts"
+SOURCE_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "sources"
+SUMMARY_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "summaries"
 ENV_FILE = BASE_DIR / ".env"
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -75,7 +80,17 @@ ENABLE_BACKGROUND_URL_JOBS = os.getenv("ENABLE_BACKGROUND_URL_JOBS", "true").str
 ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK = os.getenv("ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 TRANSCRIPTION_CHUNK_SECONDS = int(os.getenv("TRANSCRIPTION_CHUNK_SECONDS", "600"))
 LONG_TRANSCRIPT_THRESHOLD = int(os.getenv("LONG_TRANSCRIPT_THRESHOLD", "7000"))
+SUMMARY_CONCURRENCY = max(1, int(os.getenv("SUMMARY_CONCURRENCY", "3")))
+ENABLE_DEEP_ARTICLE_REFINEMENT = os.getenv("ENABLE_DEEP_ARTICLE_REFINEMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
+SOURCE_CACHE_TTL_SECONDS = int(os.getenv("SOURCE_CACHE_TTL_SECONDS", str(60 * 60 * 12)))
 GEMINI_BACKOFF_UNTIL = 0.0
+
+logger = logging.getLogger("zenpen.performance")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 WHISPER_MODEL = None
 EMBEDDER = None
@@ -99,6 +114,7 @@ class ArticlesRequest(BaseModel):
     article_type: str = "Blog Article"
     target_audience: str = "General readers"
     source_context: str = ""
+    source_cache_key: str = ""
 
 
 class PublishArticleRequest(BaseModel):
@@ -119,6 +135,28 @@ class ExportArticleRequest(BaseModel):
     topic: str
     content_html: str
     format: str = "txt"
+
+
+class StageProfiler:
+    def __init__(self, label: str):
+        self.label = label
+        self.started_at = time.perf_counter()
+        self.steps: list[tuple[str, float]] = []
+
+    @contextmanager
+    def stage(self, name: str):
+        step_start = time.perf_counter()
+        try:
+            yield
+        finally:
+            duration = time.perf_counter() - step_start
+            self.steps.append((name, duration))
+            logger.info("%s | %s | %.2fs", self.label, name, duration)
+
+    def log_total(self) -> None:
+        total = time.perf_counter() - self.started_at
+        breakdown = ", ".join(f"{name}={duration:.2f}s" for name, duration in self.steps) or "no steps"
+        logger.info("%s | total=%.2fs | %s", self.label, total, breakdown)
 
 
 class QuietYtdlpLogger:
@@ -832,6 +870,75 @@ def maybe_write_youtube_cookies_file(output_dir: Path) -> Optional[Path]:
     return cookies_path
 
 
+def cache_is_fresh(path: Path, ttl_seconds: int = SOURCE_CACHE_TTL_SECONDS) -> bool:
+    try:
+        return path.exists() and (time.time() - path.stat().st_mtime) <= ttl_seconds
+    except OSError:
+        return False
+
+
+def write_json_cache(path: Path, payload: object) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return None
+
+
+def read_json_cache(path: Path) -> Optional[object]:
+    if not cache_is_fresh(path):
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def build_content_cache_key(prefix: str, value: str) -> str:
+    digest = hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+    return f"{prefix}-{digest}"
+
+
+def source_cache_path(cache_key: str) -> Path:
+    return SOURCE_CACHE_DIR / f"{cache_key}.json"
+
+
+def load_cached_source_content(cache_key: str) -> Optional[dict[str, object]]:
+    cached = read_json_cache(source_cache_path(cache_key))
+    return cached if isinstance(cached, dict) else None
+
+
+def save_cached_source_content(cache_key: str, payload: dict[str, object]) -> None:
+    write_json_cache(source_cache_path(cache_key), payload)
+
+
+def build_summary_cache_key(text: str, query: str) -> str:
+    return build_content_cache_key("summary", f"{query}\n{text}")
+
+
+def summary_cache_path(cache_key: str) -> Path:
+    return SUMMARY_CACHE_DIR / f"{cache_key}.txt"
+
+
+def load_cached_summary(cache_key: str) -> Optional[str]:
+    path = summary_cache_path(cache_key)
+    if not cache_is_fresh(path):
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def save_cached_summary(cache_key: str, summary_text: str) -> None:
+    try:
+        path = summary_cache_path(cache_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(summary_text, encoding="utf-8")
+    except OSError:
+        return None
+
+
 def build_transcript_api_instance():
     transcript_api_class = get_youtube_transcript_api_class()
     http_proxy = get_proxy_url("http")
@@ -1016,6 +1123,12 @@ def clean_source_text(text: str) -> str:
 
 
 def extract_webpage_content(url: str) -> dict[str, object]:
+    cache_key = build_content_cache_key("webpage", url)
+    cached = load_cached_source_content(cache_key)
+    if cached:
+        logger.info("webpage-cache-hit | %s", url)
+        return cached
+
     BeautifulSoup = get_beautiful_soup_class()
     try:
         response = httpx.get(
@@ -1072,12 +1185,14 @@ def extract_webpage_content(url: str) -> dict[str, object]:
     if len(cleaned) < 120:
         raise RuntimeError("We could not extract enough readable text from that URL.")
 
-    return {
+    payload = {
         "title": title or urlparse(url).netloc,
         "meta_description": meta_description,
         "headings": headings,
         "content": cleaned,
     }
+    save_cached_source_content(cache_key, payload)
+    return payload
 
 
 def build_topic_details_bundle(summary_text: str) -> tuple[list[dict[str, str]], bool]:
@@ -1297,15 +1412,18 @@ def build_article_package(
     target_audience: str,
     variant_index: int = 0,
 ) -> dict[str, object]:
-    content = generate_article_html(
-        headline_text=headline_text,
-        summary_text=summary_text,
-        topic=topic,
-        article_type=article_type,
-        source_context=source_context,
-        target_audience=target_audience,
-        variant_index=variant_index,
-    )
+    profiler = StageProfiler(f"article-package:{clean_topic_title(topic or headline_text)}#{variant_index + 1}")
+    with profiler.stage("article_pipeline"):
+        content = generate_article_html(
+            headline_text=headline_text,
+            summary_text=summary_text,
+            topic=topic,
+            article_type=article_type,
+            source_context=source_context,
+            target_audience=target_audience,
+            variant_index=variant_index,
+            profiler=profiler,
+        )
     focus_keyword = strip_html_tags(topic).strip() or strip_html_tags(headline_text).strip()
     secondary_keywords = [
         keyword for keyword in extract_top_keywords(f"{summary_text} {topic}", limit=6)
@@ -1314,17 +1432,18 @@ def build_article_package(
     geo_keywords = build_geo_keywords(focus_keyword, secondary_keywords)
     meta_title = build_meta_title(headline_text, topic, article_type)
     meta_description = build_meta_description(summary_text)
-    scoring = score_article_output(
-        title=headline_text,
-        meta_title=meta_title,
-        meta_description=meta_description,
-        focus_keyword=focus_keyword,
-        secondary_keywords=secondary_keywords,
-        geo_keywords=geo_keywords,
-        content_html=content,
-        article_type=article_type,
-    )
-    return {
+    with profiler.stage("seo_geo_scoring"):
+        scoring = score_article_output(
+            title=headline_text,
+            meta_title=meta_title,
+            meta_description=meta_description,
+            focus_keyword=focus_keyword,
+            secondary_keywords=secondary_keywords,
+            geo_keywords=geo_keywords,
+            content_html=content,
+            article_type=article_type,
+        )
+    payload = {
         "topic": topic,
         "article_type": article_type,
         "content": content,
@@ -1337,6 +1456,8 @@ def build_article_package(
         "geo_keywords": geo_keywords,
         "seo_report": scoring,
     }
+    profiler.log_total()
+    return payload
 
 
 def clean_topic_title(title: str) -> str:
@@ -1873,15 +1994,19 @@ def transcribe_audio_with_fallback(
     cache_key: Optional[str] = None,
     progress_callback=None,
 ) -> str:
+    profiler = StageProfiler(f"transcription:{Path(audio_path).name}")
     if cache_key:
-        cached = load_cached_transcript(cache_key)
+        with profiler.stage("transcript_cache_lookup"):
+            cached = load_cached_transcript(cache_key)
         if cached:
             if progress_callback:
                 progress_callback("transcribing_audio", "Using cached transcript.", 45)
+            profiler.log_total()
             return cached
 
     with tempfile.TemporaryDirectory(prefix="transcription-chunks-") as temp_dir:
-        chunks = split_audio_for_transcription(audio_path, temp_dir)
+        with profiler.stage("audio_chunking"):
+            chunks = split_audio_for_transcription(audio_path, temp_dir)
         transcript_parts: list[str] = []
         total = len(chunks)
         for index, chunk_path in enumerate(chunks, start=1):
@@ -1895,7 +2020,8 @@ def transcribe_audio_with_fallback(
             last_error: Optional[Exception] = None
             for _ in range(2):
                 try:
-                    chunk_text = transcribe_audio(chunk_path).strip()
+                    with profiler.stage(f"transcribe_chunk_{index}"):
+                        chunk_text = transcribe_audio(chunk_path).strip()
                     if chunk_text:
                         transcript_parts.append(chunk_text)
                     last_error = None
@@ -1905,11 +2031,14 @@ def transcribe_audio_with_fallback(
             if last_error is not None:
                 raise RuntimeError(f"Transcription failed for audio part {index} of {total}.") from last_error
 
-    transcript = clean_source_text(" ".join(transcript_parts))
+    with profiler.stage("transcript_cleaning"):
+        transcript = clean_source_text(" ".join(transcript_parts))
     if not transcript.strip():
         raise RuntimeError("Transcription failed to produce readable text.")
     if cache_key:
-        save_cached_transcript(cache_key, transcript)
+        with profiler.stage("transcript_cache_store"):
+            save_cached_transcript(cache_key, transcript)
+    profiler.log_total()
     return transcript
 
 
@@ -2198,6 +2327,20 @@ Article HTML:
         return postprocess_article_html(article_html)
 
 
+def article_needs_refinement(article_html: str) -> bool:
+    text = strip_html_tags(article_html)
+    if len(text.split()) < 420:
+        return True
+    headings = re.findall(r"<h[23]>", article_html)
+    if len(headings) < 3:
+        return True
+    sentences = split_sentences(text)
+    if not sentences:
+        return False
+    unique_ratio = len(set(sentence.lower() for sentence in sentences)) / max(len(sentences), 1)
+    return unique_ratio < 0.75
+
+
 def generate_article_html(
     *,
     headline_text: str,
@@ -2207,10 +2350,11 @@ def generate_article_html(
     source_context: str,
     target_audience: str,
     variant_index: int = 0,
+    profiler: Optional[StageProfiler] = None,
 ) -> str:
     article_type = article_type if article_type in ARTICLE_TYPE_INSTRUCTIONS else "Blog Article"
     topic_text = topic or "Main Topic"
-    source_excerpt = clean_source_text(source_context or summary_text)[:4500]
+    source_excerpt = clean_source_text(source_context or summary_text)[:2800]
     keywords = extract_top_keywords(f"{summary_text} {topic_text} {source_excerpt}", limit=8)
     uniqueness_instruction = (
         "Use a fresh structure and angle for this version."
@@ -2251,13 +2395,27 @@ Instructions:
 - Return clean HTML only using <h2>, <h3>, <p>, <ul>, <li>, <strong>.
 """
     try:
-        article_text = gemini_generate_text(prompt)
+        if profiler:
+            with profiler.stage("article_generation"):
+                article_text = gemini_generate_text(prompt)
+        else:
+            article_text = gemini_generate_text(prompt)
         article_html = postprocess_article_html(article_text) or fallback_article_for_type(headline_text, summary_text, topic_text, article_type)
     except Exception:
         article_html = fallback_article_for_type(headline_text, summary_text, topic_text, article_type)
 
-    article_html = deduplicate_article_html(article_html)
-    return proofread_article_html(article_html, article_type=article_type, topic=topic_text)
+    if profiler:
+        with profiler.stage("duplicate_cleanup"):
+            article_html = deduplicate_article_html(article_html)
+    else:
+        article_html = deduplicate_article_html(article_html)
+
+    if ENABLE_DEEP_ARTICLE_REFINEMENT and article_needs_refinement(article_html):
+        if profiler:
+            with profiler.stage("proofreading_refinement"):
+                return proofread_article_html(article_html, article_type=article_type, topic=topic_text)
+        return proofread_article_html(article_html, article_type=article_type, topic=topic_text)
+    return article_html
 
 
 def build_fast_context_from_transcript(transcript: str, chunks: list[str]) -> str:
@@ -2357,7 +2515,12 @@ def enrich_analysis(
     target_audience: str = "General readers",
     source_context: str = "",
     source_type: str = "url",
+    source_cache_key: str = "",
 ) -> dict[str, object]:
+    if source_cache_key and len(source_context or "") < 1200:
+        cached_source = load_cached_source_content(source_cache_key)
+        if isinstance(cached_source, dict) and isinstance(cached_source.get("content"), str):
+            source_context = str(cached_source["content"])
     headline = result.get("headline", "Media summary")
     summary = result.get("summary", "")
     topic_details, used_fallback_topics = build_topic_details_bundle(summary)
@@ -2372,6 +2535,7 @@ def enrich_analysis(
         "target_audience": target_audience,
         "source_type": source_type,
         "source_context_preview": clean_source_text(source_context or summary)[:700],
+        "source_cache_key": source_cache_key,
         "topic_generation_warning": (
             "Topic ideas were simplified because the source content could not be fully expanded into richer angles."
             if used_fallback_topics else ""
@@ -2382,19 +2546,29 @@ def enrich_analysis(
         return payload
 
     topics_to_use = selected_topics or topics[:3] or ["Main topic"]
-    articles: list[dict[str, str]] = []
+    work_items: list[tuple[int, str, int]] = []
     for topic_index, topic in enumerate(topics_to_use):
         for variant_index in range(max(article_count, 1)):
-            articles.append(build_article_package(
-                headline_text=headline,
-                summary_text=summary,
-                topic=topic,
-                article_type=article_type,
-                source_context=source_context or summary,
-                target_audience=target_audience,
-                variant_index=(topic_index * max(article_count, 1)) + variant_index,
-            ))
-    payload["articles"] = articles
+            work_items.append(((topic_index * max(article_count, 1)) + variant_index, topic, variant_index))
+
+    def build_one(item: tuple[int, str, int]) -> tuple[int, dict[str, object]]:
+        order, topic_name, variant_index = item
+        return order, build_article_package(
+            headline_text=headline,
+            summary_text=summary,
+            topic=topic_name,
+            article_type=article_type,
+            source_context=source_context or summary,
+            target_audience=target_audience,
+            variant_index=order,
+        )
+
+    articles: list[Optional[dict[str, object]]] = [None] * len(work_items)
+    max_workers = min(2, len(work_items)) if work_items else 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for order, payload_item in executor.map(build_one, work_items):
+            articles[order] = payload_item
+    payload["articles"] = [item for item in articles if item is not None]
     return payload
 
 
@@ -2408,6 +2582,12 @@ def build_analysis_context(transcript: str, chunks: list[str], query: str) -> st
 
 
 def summarize_transcript_chunk(chunk: str, query: str) -> str:
+    cache_key = build_summary_cache_key(chunk, query)
+    cached = load_cached_summary(cache_key)
+    if cached:
+        logger.info("chunk-summary-cache-hit | %.0f chars", len(chunk))
+        return cached
+
     prompt = f"""
 You are preparing source notes for article generation.
 
@@ -2424,9 +2604,11 @@ Keep the wording clean and remove filler or transcript noise.
         raw = gemini_generate_text(prompt)
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
         bullets = [line if line.startswith("- ") else f"- {line.lstrip('- ').strip()}" for line in lines[:5]]
-        return "\n".join(bullets)
+        summary_text = "\n".join(bullets)
     except Exception:
-        return "\n".join(f"- {point}" for point in build_local_summary_points(chunk, max_points=4))
+        summary_text = "\n".join(f"- {point}" for point in build_local_summary_points(chunk, max_points=4))
+    save_cached_summary(cache_key, summary_text)
+    return summary_text
 
 
 def build_chunk_safe_analysis_input(transcript: str, query: str, progress_callback=None) -> str:
@@ -2435,17 +2617,32 @@ def build_chunk_safe_analysis_input(transcript: str, query: str, progress_callba
         return transcript
 
     transcript_chunks = chunk_text(transcript, max_chars=2800)
-    summaries: list[str] = []
     total = len(transcript_chunks)
-    for index, chunk in enumerate(transcript_chunks, start=1):
+    summaries: list[str] = [""] * total
+
+    def summarize_one(args: tuple[int, str]) -> tuple[int, str]:
+        index, chunk = args
+        return index, summarize_transcript_chunk(chunk, query)
+
+    work_items = list(enumerate(transcript_chunks))
+    if len(work_items) == 1:
+        index, summary = summarize_one(work_items[0])
+        summaries[index] = summary
         if progress_callback:
-            progress = min(88, 72 + int((index / max(total, 1)) * 14))
-            progress_callback(
-                "analyzing_topic",
-                f"Analyzing transcript part {index} of {total}...",
-                progress,
-            )
-        summaries.append(summarize_transcript_chunk(chunk, query))
+            progress_callback("chunk_summarization", "Summarizing transcript chunk 1 of 1...", 82)
+    else:
+        with ThreadPoolExecutor(max_workers=min(SUMMARY_CONCURRENCY, len(work_items))) as executor:
+            completed = 0
+            for index, summary in executor.map(summarize_one, work_items):
+                summaries[index] = summary
+                completed += 1
+                if progress_callback:
+                    progress = min(88, 72 + int((completed / max(total, 1)) * 14))
+                    progress_callback(
+                        "chunk_summarization",
+                        f"Summarizing transcript chunk {completed} of {total}...",
+                        progress,
+                    )
     return "\n".join(summaries)
 
 
@@ -2457,34 +2654,45 @@ def analyze_media(
     transcript_cache_key: Optional[str] = None,
     progress_callback=None,
 ) -> tuple[dict[str, str], str]:
+    profiler = StageProfiler(f"analyze-media:{Path(video_path or local_audio_path or 'source').name}")
     audio_source_path = None
     if local_audio_path:
         audio_source_path = local_audio_path
     elif video_path:
         with tempfile.TemporaryDirectory(prefix="media-analyzer-extract-") as temp_dir:
             extracted_audio_path = str(Path(temp_dir) / "extracted_audio.wav")
-            audio_source_path = extract_audio_from_video(video_path, extracted_audio_path)
+            with profiler.stage("source_fetch_download"):
+                audio_source_path = extract_audio_from_video(video_path, extracted_audio_path)
             if progress_callback:
                 progress_callback("transcribing_audio", "Transcribing extracted audio...", 35)
             try:
-                transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
+                with profiler.stage("transcription"):
+                    transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
             except RuntimeError as exc:
                 if "readable text" in str(exc).lower():
+                    profiler.log_total()
                     return fallback_summary("", query), ""
                 raise
             if not transcript.strip():
+                profiler.log_total()
                 return fallback_summary("", query), ""
             if progress_callback:
                 progress_callback("cleaning_transcript", "Cleaning transcript and removing repetition...", 72)
-            analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
+            with profiler.stage("chunk_summarization"):
+                analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
             chunks = chunk_text(analysis_input)
             try:
-                context = build_analysis_context(analysis_input, chunks, query)
+                with profiler.stage("topic_analysis_context"):
+                    context = build_analysis_context(analysis_input, chunks, query)
             except Exception:
                 context = " ".join(chunks[:3])
             try:
-                return gemini_rag(context, query), transcript
+                with profiler.stage("analysis_generation"):
+                    result = gemini_rag(context, query)
+                profiler.log_total()
+                return result, transcript
             except Exception:
+                profiler.log_total()
                 return fallback_summary(transcript, query), transcript
 
     if not audio_source_path:
@@ -2493,50 +2701,69 @@ def analyze_media(
     if progress_callback:
         progress_callback("transcribing_audio", "Transcribing audio...", 35)
     try:
-        transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
+        with profiler.stage("transcription"):
+            transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
     except RuntimeError as exc:
         if "readable text" in str(exc).lower():
+            profiler.log_total()
             return fallback_summary("", query), ""
         raise
     if not transcript.strip():
+        profiler.log_total()
         return fallback_summary("", query), ""
 
     if progress_callback:
         progress_callback("cleaning_transcript", "Cleaning transcript and removing repetition...", 72)
-    analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
+    with profiler.stage("chunk_summarization"):
+        analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
     chunks = chunk_text(analysis_input)
     try:
-        context = build_analysis_context(analysis_input, chunks, query)
+        with profiler.stage("topic_analysis_context"):
+            context = build_analysis_context(analysis_input, chunks, query)
     except Exception:
         context = " ".join(chunks[:3])
 
     try:
-        return gemini_rag(context, query), transcript
+        with profiler.stage("analysis_generation"):
+            result = gemini_rag(context, query)
+        profiler.log_total()
+        return result, transcript
     except Exception:
+        profiler.log_total()
         return fallback_summary(transcript, query), transcript
 
 
 def analyze_text_content(transcript: str, query: str = "Summarize the content", *, progress_callback=None) -> tuple[dict[str, str], str]:
-    transcript = clean_source_text(transcript)
+    profiler = StageProfiler("analyze-text")
+    with profiler.stage("transcript_cleaning"):
+        transcript = clean_source_text(transcript)
     if not transcript.strip():
+        profiler.log_total()
         return fallback_summary("", query), ""
 
     if progress_callback:
         progress_callback("cleaning_transcript", "Cleaning transcript and source text...", 72)
-    analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
+    with profiler.stage("chunk_summarization"):
+        analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
     chunks = chunk_text(analysis_input)
     try:
-        context = build_analysis_context(analysis_input, chunks, query)
+        with profiler.stage("topic_analysis_context"):
+            context = build_analysis_context(analysis_input, chunks, query)
     except Exception:
         context = " ".join(chunks[:3])
 
     try:
-        return gemini_rag(context, query), transcript
+        with profiler.stage("analysis_generation"):
+            result = gemini_rag(context, query)
+        profiler.log_total()
+        return result, transcript
     except Exception:
+        profiler.log_total()
         return fallback_summary(transcript, query), transcript
 
 
 def analyze_url_source(url: str, query: str = "Summarize the content", *, progress_callback=None) -> dict[str, object]:
+    profiler = StageProfiler(f"url-analysis:{url}")
     transcript_override: Optional[str] = None
     temp_audio_path: Optional[str] = None
     source_type = source_kind_from_url(url)
@@ -2547,7 +2774,8 @@ def analyze_url_source(url: str, query: str = "Summarize the content", *, progre
     if source_type == "web-url":
         if progress_callback:
             progress_callback("downloading_source", "Fetching website content...", 15)
-        webpage = extract_webpage_content(url)
+        with profiler.stage("source_fetch_download"):
+            webpage = extract_webpage_content(url)
         if progress_callback:
             progress_callback("analyzing_topic", "Analyzing topic and key ideas...", 78)
         result, cleaned_transcript = analyze_text_content(
@@ -2555,19 +2783,25 @@ def analyze_url_source(url: str, query: str = "Summarize the content", *, progre
             query=query or "Summarize the content",
             progress_callback=progress_callback,
         )
-        return enrich_analysis(
+        source_cache_key = build_content_cache_key("source-context", f"web-url|{url}|{cleaned_transcript}")
+        save_cached_source_content(source_cache_key, {"content": cleaned_transcript, "source_type": "web-url"})
+        payload = enrich_analysis(
             result,
             generate_article=False,
             source_context=cleaned_transcript or str(webpage.get("content") or ""),
             source_type="web-url",
+            source_cache_key=source_cache_key,
         )
+        profiler.log_total()
+        return payload
 
     with tempfile.TemporaryDirectory(prefix="media-analyzer-url-") as temp_dir:
         if source_type == "youtube":
             if progress_callback:
                 progress_callback("downloading_source", "Downloading source audio from YouTube...", 12)
             try:
-                temp_audio_path = download_audio(url, temp_dir)
+                with profiler.stage("source_fetch_download"):
+                    temp_audio_path = download_audio(url, temp_dir)
             except Exception as download_exc:
                 raise RuntimeError(f"Video could not be downloaded. {download_exc}") from download_exc
         else:
@@ -2575,7 +2809,8 @@ def analyze_url_source(url: str, query: str = "Summarize the content", *, progre
                 progress_callback("downloading_source", "Downloading source audio...", 12)
             if not remote_media_fallback_available():
                 raise RuntimeError("Direct remote media downloads are disabled in fast mode. Please upload the audio/video file instead.")
-            temp_audio_path = download_audio(url, temp_dir)
+            with profiler.stage("source_fetch_download"):
+                temp_audio_path = download_audio(url, temp_dir)
 
         if transcript_override is not None:
             result, cleaned_transcript = analyze_text_content(
@@ -2593,12 +2828,17 @@ def analyze_url_source(url: str, query: str = "Summarize the content", *, progre
 
     if progress_callback:
         progress_callback("finalizing_output", "Finalizing output and preparing topics...", 96)
-    return enrich_analysis(
+    source_cache_key = build_content_cache_key("source-context", f"{source_type}|{url}|{cleaned_transcript or transcript_override or result.get('summary', '')}")
+    save_cached_source_content(source_cache_key, {"content": cleaned_transcript or transcript_override or result.get("summary", ""), "source_type": source_type})
+    payload = enrich_analysis(
         result,
         generate_article=False,
         source_context=cleaned_transcript or transcript_override or result.get("summary", ""),
         source_type="youtube" if source_type == "youtube" else "media-url",
+        source_cache_key=source_cache_key,
     )
+    profiler.log_total()
+    return payload
 
 
 def serialize_job_status(job: Job) -> dict[str, object]:
@@ -2761,25 +3001,36 @@ def job_status(job_id: str) -> JSONResponse:
 
 @app.post("/api/articles")
 def generate_articles_endpoint(payload: ArticlesRequest) -> JSONResponse:
+    profiler = StageProfiler("generate-articles-endpoint")
     selected_topics = [topic.strip() for topic in payload.selected_topics if topic.strip()]
     if not selected_topics:
         raise HTTPException(status_code=400, detail="Select at least one topic before generating articles.")
+
+    source_context = payload.source_context
+    if payload.source_cache_key:
+        with profiler.stage("source_cache_lookup"):
+            cached_source = load_cached_source_content(payload.source_cache_key)
+        if isinstance(cached_source, dict) and isinstance(cached_source.get("content"), str):
+            source_context = str(cached_source["content"])
 
     base_result = {
         "headline": payload.headline.strip() or "Media summary",
         "summary": payload.summary.strip(),
     }
-    enriched_result = enrich_analysis(
-        base_result,
-        generate_article=True,
-        selected_topics=selected_topics,
-        article_count=payload.article_count,
-        article_type=payload.article_type,
-        target_audience=payload.target_audience,
-        source_context=payload.source_context,
-    )
+    with profiler.stage("article_generation"):
+        enriched_result = enrich_analysis(
+            base_result,
+            generate_article=True,
+            selected_topics=selected_topics,
+            article_count=payload.article_count,
+            article_type=payload.article_type,
+            target_audience=payload.target_audience,
+            source_context=source_context,
+            source_cache_key=payload.source_cache_key,
+        )
     if payload.topics:
         enriched_result["topics"] = payload.topics
+    profiler.log_total()
     return JSONResponse({"success": True, "result": enriched_result})
 
 
@@ -2810,32 +3061,41 @@ def publish_articles_endpoint(request: Request, payload: PublishArticleRequest) 
 
 @app.post("/api/articles/export")
 def export_article_endpoint(payload: ExportArticleRequest):
+    profiler = StageProfiler(f"export:{payload.format.lower().strip()}")
     title = payload.title.strip() or "Generated Article"
     topic = payload.topic.strip()
     content_html = payload.content_html or ""
     export_format = payload.format.lower().strip()
 
     if export_format == "txt":
-        text = f"{title}\n\nTopic: {topic}\n\n{strip_html_tags(content_html)}"
+        with profiler.stage("export_preparation"):
+            text = f"{title}\n\nTopic: {topic}\n\n{strip_html_tags(content_html)}"
+        profiler.log_total()
         return StreamingResponse(
             BytesIO(text.encode("utf-8")),
             media_type="text/plain; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{build_article_slug(title)}.txt"'},
         )
     if export_format == "html":
-        html = postprocess_article_html(content_html)
+        with profiler.stage("export_preparation"):
+            html = postprocess_article_html(content_html)
+        profiler.log_total()
         response = HTMLResponse(html)
         response.headers["Content-Disposition"] = f'attachment; filename="{build_article_slug(title)}.html"'
         return response
     if export_format == "docx":
-        data = render_article_to_docx_bytes(title, topic, content_html)
+        with profiler.stage("export_preparation"):
+            data = render_article_to_docx_bytes(title, topic, content_html)
+        profiler.log_total()
         return StreamingResponse(
             BytesIO(data),
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="{build_article_slug(title)}.docx"'},
         )
     if export_format == "pdf":
-        data = render_article_to_pdf_bytes(title, topic, content_html)
+        with profiler.stage("export_preparation"):
+            data = render_article_to_pdf_bytes(title, topic, content_html)
+        profiler.log_total()
         return StreamingResponse(
             BytesIO(data),
             media_type="application/pdf",
@@ -2856,6 +3116,7 @@ async def analyze_endpoint(
     article_type: str = Form("Blog Article"),
     target_audience: str = Form("General readers"),
 ) -> JSONResponse:
+    profiler = StageProfiler("analyze-endpoint")
     if not file and not url:
         raise HTTPException(status_code=400, detail="Please provide a URL or upload an audio/video file")
     if file:
@@ -2893,17 +3154,20 @@ async def analyze_endpoint(
             temp_audio_path: Optional[str] = None
             topic_list = [topic.strip() for topic in (selected_topics or "").split(",") if topic.strip()]
             source_context = ""
+            source_cache_key = ""
             detected_source_type = "upload" if file else source_kind_from_url(url or "")
 
             if file:
                 suffix = Path(file.filename or "upload.wav").suffix.lower() or ".wav"
                 upload_path = temp_dir_path / f"upload{suffix}"
-                await save_uploaded_file(file, upload_path)
+                with profiler.stage("source_fetch_download"):
+                    await save_uploaded_file(file, upload_path)
                 if suffix in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
-                    temp_audio_path = extract_audio_from_video(
-                        str(upload_path),
-                        str(temp_dir_path / "extracted_audio.wav"),
-                    )
+                    with profiler.stage("source_extract_audio"):
+                        temp_audio_path = extract_audio_from_video(
+                            str(upload_path),
+                            str(temp_dir_path / "extracted_audio.wav"),
+                        )
                 else:
                     temp_audio_path = str(upload_path)
                 result, cleaned_transcript = analyze_media(
@@ -2911,6 +3175,8 @@ async def analyze_endpoint(
                     query=query or "Summarize the content",
                 )
                 source_context = cleaned_transcript or str(result.get("summary") or "")
+                source_cache_key = build_content_cache_key("source-context", f"upload|{file.filename}|{source_context}")
+                save_cached_source_content(source_cache_key, {"content": source_context, "source_type": "upload"})
                 enriched_result = enrich_analysis(
                     result,
                     generate_article=generate_article,
@@ -2920,10 +3186,12 @@ async def analyze_endpoint(
                     target_audience=target_audience,
                     source_context=source_context,
                     source_type="upload",
+                    source_cache_key=source_cache_key,
                 )
             elif url:
                 enriched_result = analyze_url_source(url, query or "Summarize the content")
                 source_context = str(enriched_result.get("source_context_preview") or enriched_result.get("summary") or "")
+                source_cache_key = str(enriched_result.get("source_cache_key") or "")
                 if generate_article:
                     existing_topics = list(enriched_result.get("topics") or [])
                     base_result = {
@@ -2939,6 +3207,7 @@ async def analyze_endpoint(
                         target_audience=target_audience,
                         source_context=source_context,
                         source_type=detected_source_type,
+                        source_cache_key=source_cache_key,
                     )
                     enriched_result["topics"] = existing_topics
             source = "uploaded-file" if file else ("youtube-url" if detected_source_type == "youtube" else "remote-url")
@@ -2962,6 +3231,7 @@ async def analyze_endpoint(
                     )
                 except Exception:
                     pass
+            profiler.log_total()
             return JSONResponse({"success": True, "result": enriched_result})
     except HTTPException:
         raise

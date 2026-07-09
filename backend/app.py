@@ -46,6 +46,8 @@ WHISPER_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "whisper"
 TRANSCRIPT_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "transcripts"
 SOURCE_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "sources"
 SUMMARY_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "summaries"
+ANALYSIS_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "analysis"
+ARTICLE_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "articles"
 ENV_FILE = BASE_DIR / ".env"
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -83,6 +85,10 @@ LONG_TRANSCRIPT_THRESHOLD = int(os.getenv("LONG_TRANSCRIPT_THRESHOLD", "7000"))
 SUMMARY_CONCURRENCY = max(1, int(os.getenv("SUMMARY_CONCURRENCY", "3")))
 ENABLE_DEEP_ARTICLE_REFINEMENT = os.getenv("ENABLE_DEEP_ARTICLE_REFINEMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 SOURCE_CACHE_TTL_SECONDS = int(os.getenv("SOURCE_CACHE_TTL_SECONDS", str(60 * 60 * 12)))
+YOUTUBE_DIRECT_ANALYSIS_TIMEOUT = int(os.getenv("YOUTUBE_DIRECT_ANALYSIS_TIMEOUT", "90"))
+YOUTUBE_TRANSCRIPT_TIMEOUT = int(os.getenv("YOUTUBE_TRANSCRIPT_TIMEOUT", "45"))
+YOUTUBE_SUBTITLE_TIMEOUT = int(os.getenv("YOUTUBE_SUBTITLE_TIMEOUT", "60"))
+YOUTUBE_FALLBACK_TIMEOUT = int(os.getenv("YOUTUBE_FALLBACK_TIMEOUT", "180"))
 GEMINI_BACKOFF_UNTIL = 0.0
 
 logger = logging.getLogger("zenpen.performance")
@@ -135,6 +141,11 @@ class ExportArticleRequest(BaseModel):
     topic: str
     content_html: str
     format: str = "txt"
+
+
+class AnalyzeYouTubeRequest(BaseModel):
+    url: str
+    query: str = "Give breaking news and main points"
 
 
 class StageProfiler:
@@ -383,6 +394,8 @@ def map_public_error_message(raw_message: str, *, context: str = "analysis") -> 
         return "That file could not be processed as audio or video. Please upload a supported media file."
     if "video could not be downloaded" in lower:
         return "Video could not be downloaded. The source may be private, unavailable, or blocking automated access."
+    if "gemini could not analyze the video directly" in lower:
+        return "Gemini could not analyze the video directly."
     if "transcription failed" in lower:
         return "Transcription failed. Please try another source or upload a clearer audio/video file."
     if "website blocked direct content extraction" in lower:
@@ -392,7 +405,13 @@ def map_public_error_message(raw_message: str, *, context: str = "analysis") -> 
     if "rate" in lower and "limit" in lower:
         return "The AI service is busy right now. Please wait a moment and try again."
     if "timeout" in lower:
+        if "youtube metadata analysis" in lower or "youtube transcript fetch" in lower or "youtube subtitle fetch" in lower:
+            return "Direct video analysis timed out. Please retry or try another video."
+        if "transcription fallback" in lower or "video download" in lower:
+            return "Fallback processing timed out before the video could be transcribed."
         return "The request took too long to complete. Please try again."
+    if "private" in lower or "unavailable" in lower:
+        return "Source is private or unavailable."
     if "unsupported video format" in lower:
         return "Please upload a supported audio or video file."
     if "gemini" in lower or "googleapierror" in lower:
@@ -939,6 +958,44 @@ def save_cached_summary(cache_key: str, summary_text: str) -> None:
         return None
 
 
+def analysis_cache_path(cache_key: str) -> Path:
+    return ANALYSIS_CACHE_DIR / f"{cache_key}.json"
+
+
+def load_cached_analysis_result(cache_key: str) -> Optional[dict[str, object]]:
+    cached = read_json_cache(analysis_cache_path(cache_key))
+    return cached if isinstance(cached, dict) else None
+
+
+def save_cached_analysis_result(cache_key: str, payload: dict[str, object]) -> None:
+    write_json_cache(analysis_cache_path(cache_key), payload)
+
+
+def article_cache_path(cache_key: str) -> Path:
+    return ARTICLE_CACHE_DIR / f"{cache_key}.json"
+
+
+def load_cached_article_result(cache_key: str) -> Optional[dict[str, object]]:
+    cached = read_json_cache(article_cache_path(cache_key))
+    return cached if isinstance(cached, dict) else None
+
+
+def save_cached_article_result(cache_key: str, payload: dict[str, object]) -> None:
+    write_json_cache(article_cache_path(cache_key), payload)
+
+
+def run_with_timeout(label: str, timeout_seconds: int, func, *args, **kwargs):
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except Exception as exc:
+            from concurrent.futures import TimeoutError as FutureTimeoutError
+            if isinstance(exc, FutureTimeoutError):
+                raise RuntimeError(f"{label} timed out.") from exc
+            raise
+
+
 def build_transcript_api_instance():
     transcript_api_class = get_youtube_transcript_api_class()
     http_proxy = get_proxy_url("http")
@@ -1000,6 +1057,64 @@ def fetch_youtube_transcript_text(url: str) -> str:
     if not transcript_text:
         raise RuntimeError("No transcript text was available for this YouTube video.")
     return transcript_text
+
+
+def fetch_youtube_metadata(url: str) -> dict[str, object]:
+    yt_dlp = get_yt_dlp_module()
+    output_dir = Path(tempfile.mkdtemp(prefix="yt-meta-"))
+    cookies_file = maybe_write_youtube_cookies_file(output_dir)
+    opts: dict[str, object] = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 25,
+        "retries": 2,
+        "logger": QuietYtdlpLogger(),
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/127.0.0.0 Safari/537.36"
+            )
+        },
+    }
+    proxy_url = get_proxy_url("https")
+    if proxy_url:
+        opts["proxy"] = proxy_url
+    if cookies_file:
+        opts["cookiefile"] = str(cookies_file)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = normalize_yt_info_entry(ydl.extract_info(url, download=False))
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+    return {
+        "title": str(info.get("title") or "").strip(),
+        "description": str(info.get("description") or "").strip(),
+        "channel": str(info.get("channel") or info.get("uploader") or "").strip(),
+        "duration": int(info.get("duration") or 0),
+        "categories": [str(item).strip() for item in (info.get("categories") or []) if str(item).strip()],
+        "tags": [str(item).strip() for item in (info.get("tags") or [])[:12] if str(item).strip()],
+        "webpage_url": str(info.get("webpage_url") or url).strip(),
+    }
+
+
+def build_youtube_source_text(metadata: dict[str, object], transcript_text: str = "") -> str:
+    title = str(metadata.get("title") or "")
+    description = str(metadata.get("description") or "")
+    channel = str(metadata.get("channel") or "")
+    categories = ", ".join(metadata.get("categories") or [])
+    tags = ", ".join(metadata.get("tags") or [])
+    pieces = [
+        f"Video title: {title}",
+        f"Channel: {channel}" if channel else "",
+        f"Categories: {categories}" if categories else "",
+        f"Tags: {tags}" if tags else "",
+        f"Description: {description}" if description else "",
+        transcript_text or "",
+    ]
+    return clean_source_text("\n".join(piece for piece in pieces if piece).strip())
 
 
 def clean_vtt_caption_text(raw_text: str) -> str:
@@ -2762,6 +2877,97 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content", 
         return fallback_summary(transcript, query), transcript
 
 
+def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress_callback=None) -> tuple[dict[str, str], str]:
+    with tempfile.TemporaryDirectory(prefix="media-analyzer-youtube-fallback-") as temp_dir:
+        if progress_callback:
+            progress_callback("fallback_transcription", "Direct video analysis failed. Trying audio transcription fallback...", 38)
+        temp_audio_path = run_with_timeout(
+            "Video download",
+            min(120, YOUTUBE_FALLBACK_TIMEOUT),
+            download_audio,
+            url,
+            temp_dir,
+        )
+        return run_with_timeout(
+            "Transcription fallback",
+            YOUTUBE_FALLBACK_TIMEOUT,
+            analyze_media,
+            None,
+            temp_audio_path,
+            query,
+            transcript_cache_key=build_transcript_cache_key(url),
+            progress_callback=progress_callback,
+        )
+
+
+def analyze_youtube_source(url: str, query: str = "Summarize the content", *, progress_callback=None) -> dict[str, object]:
+    profiler = StageProfiler(f"youtube-analysis:{url}")
+    analysis_cache_key = build_content_cache_key("youtube-analysis", f"{url}|{query}")
+    with profiler.stage("analysis_cache_lookup"):
+        cached = load_cached_analysis_result(analysis_cache_key)
+    if cached:
+        logger.info("youtube-analysis-cache-hit | %s", url)
+        profiler.log_total()
+        return cached
+
+    metadata: dict[str, object] = {}
+    transcript_text = ""
+    source_context = ""
+    direct_failure: Optional[Exception] = None
+
+    if progress_callback:
+        progress_callback("analyzing_video", "Analyzing video with Gemini...", 12)
+
+    try:
+        with profiler.stage("source_fetch_download"):
+            metadata = run_with_timeout("YouTube metadata analysis", 35, fetch_youtube_metadata, url)
+        with tempfile.TemporaryDirectory(prefix="yt-direct-analysis-") as temp_dir:
+            try:
+                with profiler.stage("transcription"):
+                    transcript_text = run_with_timeout("YouTube transcript fetch", YOUTUBE_TRANSCRIPT_TIMEOUT, fetch_youtube_transcript_text, url)
+            except Exception:
+                try:
+                    with profiler.stage("transcription"):
+                        transcript_text = run_with_timeout("YouTube subtitle fetch", YOUTUBE_SUBTITLE_TIMEOUT, fetch_youtube_subtitles_text, url, temp_dir)
+                except Exception as subtitle_exc:
+                    direct_failure = subtitle_exc
+        with profiler.stage("transcript_cleaning"):
+            source_context = build_youtube_source_text(metadata, transcript_text)
+        if not source_context.strip():
+            raise RuntimeError("Gemini could not analyze the video from the available source data.")
+        if progress_callback:
+            progress_callback("extracting_topics", "Extracting headline, summary, and main topics...", 68)
+        with profiler.stage("analysis_generation"):
+            result, cleaned_transcript = analyze_text_content(
+                source_context,
+                query=query or "Summarize the content",
+                progress_callback=progress_callback,
+            )
+        source_context = cleaned_transcript or source_context
+    except Exception as direct_exc:
+        direct_failure = direct_exc
+        if not remote_media_fallback_available():
+            raise RuntimeError("Gemini could not analyze the video directly, and fallback processing is not available.") from direct_exc
+        result, cleaned_transcript = analyze_youtube_via_transcription_fallback(url, query or "Summarize the content", progress_callback=progress_callback)
+        source_context = cleaned_transcript or source_context
+
+    if progress_callback:
+        progress_callback("finalizing_output", "Finalizing headline, summary, and topic list...", 94)
+    source_cache_key = build_content_cache_key("source-context", f"youtube|{url}|{source_context or result.get('summary', '')}")
+    save_cached_source_content(source_cache_key, {"content": source_context or str(result.get("summary") or ""), "source_type": "youtube"})
+    payload = enrich_analysis(
+        result,
+        generate_article=False,
+        source_context=source_context or str(result.get("summary") or ""),
+        source_type="youtube",
+        source_cache_key=source_cache_key,
+    )
+    payload["direct_analysis"] = direct_failure is None
+    save_cached_analysis_result(analysis_cache_key, payload)
+    profiler.log_total()
+    return payload
+
+
 def analyze_url_source(url: str, query: str = "Summarize the content", *, progress_callback=None) -> dict[str, object]:
     profiler = StageProfiler(f"url-analysis:{url}")
     transcript_override: Optional[str] = None
@@ -2770,6 +2976,11 @@ def analyze_url_source(url: str, query: str = "Summarize the content", *, progre
 
     if source_type == "unsupported":
         raise RuntimeError("Direct image links are not supported yet. Please use a webpage, YouTube/video URL, or upload an audio/video file.")
+
+    if source_type == "youtube":
+        payload = analyze_youtube_source(url, query or "Summarize the content", progress_callback=progress_callback)
+        profiler.log_total()
+        return payload
 
     if source_type == "web-url":
         if progress_callback:
@@ -2874,6 +3085,63 @@ def serialize_job_status(job: Job) -> dict[str, object]:
         "jobId": job.id,
         "progress": progress_payload,
     }
+
+
+def build_articles_response(payload: ArticlesRequest) -> dict[str, object]:
+    profiler = StageProfiler("generate-articles-endpoint")
+    selected_topics = [topic.strip() for topic in payload.selected_topics if topic.strip()]
+    if not selected_topics:
+        raise HTTPException(status_code=400, detail="Select at least one topic before generating articles.")
+
+    source_context = payload.source_context
+    if payload.source_cache_key:
+        with profiler.stage("source_cache_lookup"):
+            cached_source = load_cached_source_content(payload.source_cache_key)
+        if isinstance(cached_source, dict) and isinstance(cached_source.get("content"), str):
+            source_context = str(cached_source["content"])
+
+    article_cache_key = build_content_cache_key(
+        "article-result",
+        json.dumps(
+            {
+                "headline": payload.headline.strip() or "Media summary",
+                "summary": payload.summary.strip(),
+                "selected_topics": selected_topics,
+                "article_count": payload.article_count,
+                "article_type": payload.article_type,
+                "target_audience": payload.target_audience,
+                "source_cache_key": payload.source_cache_key,
+                "source_context": source_context[:2500],
+            },
+            sort_keys=True,
+        ),
+    )
+    with profiler.stage("article_cache_lookup"):
+        cached_articles = load_cached_article_result(article_cache_key)
+    if isinstance(cached_articles, dict):
+        profiler.log_total()
+        return cached_articles
+
+    base_result = {
+        "headline": payload.headline.strip() or "Media summary",
+        "summary": payload.summary.strip(),
+    }
+    with profiler.stage("article_generation"):
+        enriched_result = enrich_analysis(
+            base_result,
+            generate_article=True,
+            selected_topics=selected_topics,
+            article_count=payload.article_count,
+            article_type=payload.article_type,
+            target_audience=payload.target_audience,
+            source_context=source_context,
+            source_cache_key=payload.source_cache_key,
+        )
+    if payload.topics:
+        enriched_result["topics"] = payload.topics
+    save_cached_article_result(article_cache_key, enriched_result)
+    profiler.log_total()
+    return enriched_result
 
 
 def render_article_to_docx_bytes(title: str, topic: str, content_html: str) -> bytes:
@@ -2999,38 +3267,55 @@ def job_status(job_id: str) -> JSONResponse:
     return JSONResponse(payload, status_code=status_code)
 
 
+@app.post("/api/analyze-youtube")
+def analyze_youtube_endpoint(payload: AnalyzeYouTubeRequest, request: Request) -> JSONResponse:
+    url = payload.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Please provide a YouTube URL.")
+    if not is_youtube_url(url):
+        raise HTTPException(status_code=400, detail="Only YouTube links are supported by this endpoint.")
+
+    try:
+        user = resolve_supabase_user(request)
+        if background_url_jobs_available():
+            job = enqueue_url_analysis(
+                url=url,
+                query=payload.query or "Give breaking news and main points",
+                user_id=str(user["id"]) if user else None,
+            )
+            return JSONResponse(
+                {
+                    "success": True,
+                    "queued": True,
+                    "jobId": job.id,
+                    "status": "queued",
+                    "progress": {
+                        "stage": "analyzing_video",
+                        "message": "Analyzing video with Gemini...",
+                        "progress": 6,
+                    },
+                },
+                status_code=202,
+            )
+
+        result = analyze_youtube_source(url, payload.query or "Give breaking news and main points")
+        return JSONResponse({"success": True, "result": result})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("youtube-analyze-failed")
+        return JSONResponse({"success": False, "error": map_public_error_message(str(exc))}, status_code=500)
+
+
 @app.post("/api/articles")
 def generate_articles_endpoint(payload: ArticlesRequest) -> JSONResponse:
-    profiler = StageProfiler("generate-articles-endpoint")
-    selected_topics = [topic.strip() for topic in payload.selected_topics if topic.strip()]
-    if not selected_topics:
-        raise HTTPException(status_code=400, detail="Select at least one topic before generating articles.")
+    enriched_result = build_articles_response(payload)
+    return JSONResponse({"success": True, "result": enriched_result})
 
-    source_context = payload.source_context
-    if payload.source_cache_key:
-        with profiler.stage("source_cache_lookup"):
-            cached_source = load_cached_source_content(payload.source_cache_key)
-        if isinstance(cached_source, dict) and isinstance(cached_source.get("content"), str):
-            source_context = str(cached_source["content"])
 
-    base_result = {
-        "headline": payload.headline.strip() or "Media summary",
-        "summary": payload.summary.strip(),
-    }
-    with profiler.stage("article_generation"):
-        enriched_result = enrich_analysis(
-            base_result,
-            generate_article=True,
-            selected_topics=selected_topics,
-            article_count=payload.article_count,
-            article_type=payload.article_type,
-            target_audience=payload.target_audience,
-            source_context=source_context,
-            source_cache_key=payload.source_cache_key,
-        )
-    if payload.topics:
-        enriched_result["topics"] = payload.topics
-    profiler.log_total()
+@app.post("/api/generate-article")
+def generate_article_alias_endpoint(payload: ArticlesRequest) -> JSONResponse:
+    enriched_result = build_articles_response(payload)
     return JSONResponse({"success": True, "result": enriched_result})
 
 
@@ -3135,6 +3420,7 @@ async def analyze_endpoint(
                 query=query or "Summarize the content",
                 user_id=str(user["id"]) if user else None,
             )
+            is_youtube = is_youtube_url(url)
             return JSONResponse(
                 {
                     "success": True,
@@ -3142,8 +3428,8 @@ async def analyze_endpoint(
                     "jobId": job.id,
                     "status": "queued",
                     "progress": {
-                        "stage": "downloading_source",
-                        "message": "This video is long, so we are transcribing it in parts. Please wait while we process it.",
+                        "stage": "analyzing_video" if is_youtube else "downloading_source",
+                        "message": "Analyzing video with Gemini..." if is_youtube else "Preparing source...",
                         "progress": 5,
                     },
                 },

@@ -27,7 +27,10 @@ def process_url_analysis_job(
 ) -> dict[str, object]:
     from backend import app as app_module
 
-    update_job_progress("downloading_source", "Downloading source...", 8)
+    if app_module.is_youtube_url(url):
+        update_job_progress("analyzing_video", "Analyzing video with Gemini...", 8)
+    else:
+        update_job_progress("downloading_source", "Downloading source...", 8)
     enriched_result = app_module.analyze_url_source(
         url,
         query or "Summarize the content",
@@ -67,6 +70,7 @@ def enqueue_url_analysis(
     queue = get_url_analysis_queue()
     if queue is None:
         raise RuntimeError("Redis queue is not configured.")
+    is_youtube = "youtube.com" in url or "youtu.be" in url
 
     job = queue.enqueue(
         process_url_analysis_job,
@@ -78,11 +82,11 @@ def enqueue_url_analysis(
         retry=Retry(max=3, interval=[10, 30, 60]),
         result_ttl=86400,
         failure_ttl=604800,
-        job_timeout=1800,
+        job_timeout=240,
         description=f"Analyze URL: {url}",
     )
-    job.meta["stage"] = "downloading_source"
-    job.meta["message"] = "This video is long, so we are transcribing it in parts. Please wait while we process it."
+    job.meta["stage"] = "analyzing_video" if is_youtube else "downloading_source"
+    job.meta["message"] = "Analyzing video with Gemini..." if is_youtube else "Preparing source..."
     job.meta["progress"] = 5
     job.save_meta()
     return job

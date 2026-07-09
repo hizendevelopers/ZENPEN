@@ -6,6 +6,7 @@ from app import (
     ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
     analyze_text_content,
     app,
+    analyze_youtube_source,
     analyze_url_source,
     build_chunk_safe_analysis_input,
     build_content_cache_key,
@@ -249,10 +250,11 @@ def test_generate_article_html_skips_proofread_in_fast_mode(monkeypatch):
     assert '<h2>Headline</h2>' in html
 
 
-def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
+def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
-    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Transcript from YouTube captions.')
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript from YouTube captions.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
@@ -270,10 +272,13 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
     assert payload['result']['topics'] == ['Topic A']
 
 
-def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch):
+def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
-    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Transcript available immediately.')
+    download_calls = {'count': 0}
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: download_calls.__setitem__('count', download_calls['count'] + 1) or 'fake-audio.wav')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
@@ -288,6 +293,7 @@ def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch
     payload = response.json()
     assert payload['success'] is True
     assert payload['result']['topics'] == ['Topic A']
+    assert download_calls['count'] == 0
 
 
 def test_health_endpoint():
@@ -451,9 +457,10 @@ def test_analyze_endpoint_rejects_unsupported_upload_type():
     assert response.json()['detail'] == 'Unsupported file type. Please upload an audio or video file.'
 
 
-def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
-    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Transcript available immediately.')
+def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'},
@@ -466,9 +473,11 @@ def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
     assert result['articles'] == []
 
 
-def test_analyze_url_source_downloads_and_transcribes_youtube(monkeypatch):
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
-    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Subtitle transcript available immediately.')
+def test_analyze_url_source_downloads_and_transcribes_youtube(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
+    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: 'Subtitle transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
@@ -499,20 +508,65 @@ def test_analyze_url_source_uses_real_webpage_content(monkeypatch):
     assert result['source_context_preview']
 
 
-def test_analyze_url_source_fails_fast_when_youtube_text_is_unavailable(monkeypatch):
-    monkeypatch.setattr('app.ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK', False)
-    monkeypatch.setattr('app.APIFY_TOKEN', '')
-    monkeypatch.setattr('app.YOUTUBE_PROXY_HTTP', '')
-    monkeypatch.setattr('app.YOUTUBE_PROXY_HTTPS', '')
-    monkeypatch.setattr('app.YOUTUBE_PROXY_URL', '')
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
+def test_analyze_youtube_source_falls_back_when_direct_analysis_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: (_ for _ in ()).throw(RuntimeError('direct failed')))
+    monkeypatch.setattr('app.remote_media_fallback_available', lambda: True)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Recovered transcript from fallback path.')
+    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
+    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
+        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
+    ])
 
-    try:
-        analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
-    except RuntimeError as exc:
-        assert 'Video could not be downloaded' in str(exc)
-    else:
-        raise AssertionError('Expected RuntimeError')
+    result = analyze_youtube_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
+
+    assert result['topics'] == ['Topic A']
+    assert result['direct_analysis'] is False
+
+
+def test_analyze_youtube_endpoint_uses_cache(monkeypatch):
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
+    calls = {'count': 0}
+
+    def fake_analyze_youtube_source(url, query, progress_callback=None):
+        calls['count'] += 1
+        return {
+            'headline': 'Cached headline',
+            'summary': '- point one',
+            'topics': ['Topic A'],
+            'topic_details': [{'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}],
+            'articles': [],
+            'source_cache_key': 'cache-key',
+        }
+
+    monkeypatch.setattr('app.analyze_youtube_source', fake_analyze_youtube_source)
+
+    response_one = client.post('/api/analyze-youtube', json={'url': 'https://www.youtube.com/watch?v=abc123', 'query': 'Summarize'})
+    response_two = client.post('/api/analyze-youtube', json={'url': 'https://www.youtube.com/watch?v=abc123', 'query': 'Summarize'})
+
+    assert response_one.status_code == 200
+    assert response_two.status_code == 200
+    assert calls['count'] == 2
+
+
+def test_generate_article_alias_endpoint(monkeypatch):
+    monkeypatch.setattr('app.build_articles_response', lambda payload: {'headline': 'Headline', 'summary': '- point', 'topics': ['Topic A'], 'articles': [{'topic': 'Topic A', 'content': '<h2>Done</h2>'}]})
+
+    response = client.post('/api/generate-article', json={
+        'headline': 'Headline',
+        'summary': '- point',
+        'topics': ['Topic A'],
+        'selected_topics': ['Topic A'],
+        'article_count': 1,
+        'article_type': 'Blog Article',
+        'target_audience': 'General readers',
+        'source_context': 'Source context',
+        'source_cache_key': 'cache-key',
+    })
+
+    assert response.status_code == 200
+    assert response.json()['result']['articles'][0]['topic'] == 'Topic A'
 
 
 def test_build_topic_details_bundle_deduplicates_titles(monkeypatch):
@@ -544,7 +598,7 @@ def test_analyze_endpoint_queues_url_job_when_background_workers_are_available(m
     assert payload['success'] is True
     assert payload['queued'] is True
     assert payload['jobId'] == 'job-123'
-    assert payload['progress']['stage'] == 'downloading_source'
+    assert payload['progress']['stage'] == 'analyzing_video'
 
 
 def test_job_status_endpoint_returns_completed_result(monkeypatch):

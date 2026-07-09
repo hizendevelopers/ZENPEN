@@ -250,11 +250,14 @@ function mapUserFacingError(error) {
   if (lower.includes('invalid email or password')) return 'We could not log you in with those details.';
   if (lower.includes('please provide')) return 'Please provide a supported source before continuing.';
   if (lower.includes('unsupported')) return 'That source type is not supported for this action.';
-  if (lower.includes('video could not be downloaded')) return 'Video could not be downloaded. The source may be private, unavailable, or blocking automated access.';
+  if (lower.includes('video could not be downloaded')) return 'Video could not be downloaded. The source may be private or unavailable.';
+  if (lower.includes('source is private or unavailable')) return 'Source is private or unavailable.';
+  if (lower.includes('gemini could not analyze the video directly')) return 'Direct video analysis failed. Trying audio transcription fallback may be required.';
   if (lower.includes('transcription failed')) return 'Transcription failed. Please try another source or upload the audio/video file directly.';
   if (lower.includes('website blocked automated access')) return 'The website blocked automated access. Please try another public URL.';
-  if (lower.includes('could not provide transcript or subtitle text quickly enough')) return 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
+  if (lower.includes('could not provide transcript or subtitle text quickly enough')) return 'Direct video analysis failed. Trying audio transcription fallback...';
   if (lower.includes('youtube video cannot be accessed')) return 'This YouTube video cannot be processed right now. Please try another source or upload the file.';
+  if (lower.includes('timed out')) return 'Processing timed out. Please retry or try a different source.';
   if (lower.includes('rate') && lower.includes('busy')) return 'The AI service is busy right now. Please retry in a moment.';
   if (/\b\d{3}\b/.test(message) || lower.includes('traceback') || lower.includes('runtimeerror')) {
     return 'We could not complete that request right now. Please try again.';
@@ -726,7 +729,7 @@ function buildAnalysisSummary() {
     return `<div class="state-panel loading-state"><div class="loader"></div><p>${escapeHtml(appState.busyMessage)}</p></div>`;
   }
   if (appState.analysisError) {
-    return `<div class="state-panel error-state">${escapeHtml(appState.analysisError)}</div>`;
+    return `<div class="state-panel error-state"><p>${escapeHtml(appState.analysisError)}</p><button class="ghost-btn" data-action="retry-analysis">Retry</button></div>`;
   }
   if (!appState.analysisResult) {
     return `<div class="state-panel empty-state">No analysis yet. Submit a URL or upload a video to begin.</div>`;
@@ -759,7 +762,7 @@ function buildTopicSelector() {
     explanation: '',
     importance: '',
   }));
-  const selectedSet = new Set(appState.selectedTopics.length ? appState.selectedTopics : topics.slice(0, 3));
+  const selectedTopic = appState.selectedTopics[0] || topics[0];
   const articleState = appState.busyMode === 'articles'
     ? `<div class="state-banner loading-state inline-state"><div class="loader small-loader"></div><span>${escapeHtml(appState.busyMessage)}</span></div>`
     : appState.articleError
@@ -770,19 +773,9 @@ function buildTopicSelector() {
     <section class="topic-section">
       <div class="section-heading compact-heading">
         <span class="eyebrow">Detected Topics</span>
-        <h3>Select topics for article generation</h3>
+        <h3>Select one topic for article generation</h3>
       </div>
-        <form id="topic-selection-form" class="topic-form">
-          <div class="topic-selector-list">
-            ${topicDetails.map((topic) => `
-              <label class="topic-option">
-                <input type="checkbox" name="selected-topic" value="${escapeHtml(topic.title)}" ${selectedSet.has(topic.title) ? 'checked' : ''} />
-                <span class="topic-pill">${escapeHtml(topic.title)}</span>
-                ${topic.explanation ? `<span class="topic-option-copy">${topic.explanation}</span>` : ''}
-                ${topic.importance ? `<span class="topic-option-note">${topic.importance}</span>` : ''}
-              </label>
-            `).join('')}
-          </div>
+        <div class="topic-form">
         <div class="topic-actions two-row-actions">
           <label>
             Article type
@@ -797,15 +790,18 @@ function buildTopicSelector() {
             <input id="target-audience-input" name="target_audience" type="text" value="${escapeHtml(appState.formValues.targetAudience)}" placeholder="General readers" />
           </label>
         </div>
-        <div class="topic-actions">
-          <label>
-            Articles per topic
-            <input id="article-count-input" name="article_count" type="number" min="1" max="3" value="${escapeHtml(appState.formValues.articleCount)}" />
-          </label>
-          <button class="primary-btn" type="submit" ${appState.busyMode === 'articles' ? 'disabled' : ''}>Generate Articles</button>
-        </div>
+          <div class="topic-selector-list">
+            ${topicDetails.map((topic) => `
+              <article class="topic-option ${selectedTopic === topic.title ? 'topic-option-active' : ''}">
+                <span class="topic-pill">${escapeHtml(topic.title)}</span>
+                ${topic.explanation ? `<span class="topic-option-copy">${topic.explanation}</span>` : ''}
+                ${topic.importance ? `<span class="topic-option-note">${topic.importance}</span>` : ''}
+                <button class="primary-btn" type="button" data-action="generate-topic-article" data-topic-title="${escapeHtml(topic.title)}" ${appState.busyMode === 'articles' ? 'disabled' : ''}>Generate Article</button>
+              </article>
+            `).join('')}
+          </div>
         ${articleState}
-      </form>
+      </div>
     </section>
   `;
 }
@@ -1019,7 +1015,7 @@ function buildAuthHeaders() {
   return {};
 }
 
-async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
+async function sendAnalyzeRequest({ generateArticle, selectedTopics, source, endpoint = '/api/analyze' }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180000);
   const formData = new FormData();
@@ -1033,10 +1029,20 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
   if (selectedTopics?.length) formData.append('selected_topics', selectedTopics.join(','));
 
   try {
-    const response = await fetch('/api/analyze', {
+    const response = await fetch(endpoint, {
       method: 'POST',
-      headers: buildAuthHeaders(),
-      body: formData,
+      headers: endpoint === '/api/analyze-youtube'
+        ? {
+            'Content-Type': 'application/json',
+            ...buildAuthHeaders(),
+          }
+        : buildAuthHeaders(),
+      body: endpoint === '/api/analyze-youtube'
+        ? JSON.stringify({
+            url: source.url,
+            query: source.query || 'Give breaking news and main points',
+          })
+        : formData,
       signal: controller.signal,
     });
     const responseText = await response.text();
@@ -1254,19 +1260,27 @@ async function handleAnalyzeSubmit(form) {
   appState.publishError = '';
   appState.successMessage = '';
   appState.busyMode = 'analyzing';
+  const youtubeMode = sourceMode !== 'upload' && url && /youtu(\.be|be\.com)/i.test(url);
   appState.busyMessage = sourceMode === 'upload'
     ? 'Uploading your media and preparing transcription...'
-    : 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
+    : youtubeMode
+      ? 'Analyzing video with Gemini...'
+      : 'Preparing source and extracting content...';
   startBusyStatusTimer('analyzing');
   renderApp();
 
     try {
       const source = { url, query, file };
       appState.lastSubmission = source;
-      const payload = await sendAnalyzeRequest({ generateArticle: false, selectedTopics: [], source });
+      const payload = await sendAnalyzeRequest({
+        generateArticle: false,
+        selectedTopics: [],
+        source,
+        endpoint: youtubeMode ? '/api/analyze-youtube' : '/api/analyze',
+      });
       if (payload.queued && payload.jobId) {
         appState.busyMode = 'analyzing';
-        appState.busyMessage = payload.progress?.message || 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
+        appState.busyMessage = payload.progress?.message || 'Analyzing video with Gemini...';
         appState.activeJobStage = payload.progress?.stage || '';
         startAnalysisPolling(payload.jobId);
         renderApp();
@@ -1318,6 +1332,45 @@ async function handleArticleGeneration(form) {
       topics: appState.analysisResult?.topics || [],
       selectedTopics,
       articleCount: appState.formValues.articleCount,
+    });
+    appState.analysisResult = result;
+    clearBusyStates();
+    renderApp();
+  } catch (error) {
+    appState.articleError = mapUserFacingError(error);
+    clearBusyStates();
+    renderApp();
+  }
+}
+
+async function handleDirectTopicArticleGeneration(topic) {
+  if (appState.busyMode === 'articles') return;
+  if (!appState.analysisResult) {
+    appState.articleError = 'Analyze content first before generating an article.';
+    renderApp();
+    return;
+  }
+  const articleTypeInput = document.getElementById('article-type-input');
+  const targetAudienceInput = document.getElementById('target-audience-input');
+  appState.selectedTopics = [topic];
+  appState.formValues.articleType = articleTypeInput?.value || appState.formValues.articleType || 'Blog Article';
+  appState.formValues.targetAudience = targetAudienceInput?.value?.trim() || appState.formValues.targetAudience || 'General readers';
+  appState.formValues.articleCount = '1';
+  appState.articleError = '';
+  appState.publishError = '';
+  appState.successMessage = '';
+  appState.busyMode = 'articles';
+  appState.busyMessage = 'Writing article for selected topic...';
+  startBusyStatusTimer('articles');
+  renderApp();
+
+  try {
+    const result = await sendGenerateArticlesRequest({
+      headline: appState.analysisResult?.headline || 'Media summary',
+      summary: appState.analysisResult?.summary || '',
+      topics: appState.analysisResult?.topics || [],
+      selectedTopics: [topic],
+      articleCount: 1,
     });
     appState.analysisResult = result;
     clearBusyStates();
@@ -1508,6 +1561,26 @@ function attachDelegatedHandlers() {
       clearSession();
       resetGeneratorState();
       navigate('/');
+      return;
+    }
+
+    if (button.dataset.action === 'retry-analysis') {
+      if (appState.lastSubmission) {
+        appState.analysisError = '';
+        renderApp();
+        const form = document.getElementById('article-generator-form');
+        if (form) {
+          handleAnalyzeSubmit(form);
+        }
+      }
+      return;
+    }
+
+    if (button.dataset.action === 'generate-topic-article') {
+      const topicTitle = button.dataset.topicTitle || '';
+      if (topicTitle) {
+        handleDirectTopicArticleGeneration(topicTitle);
+      }
       return;
     }
 

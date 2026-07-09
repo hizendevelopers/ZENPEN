@@ -130,6 +130,11 @@ BANNED_ARTICLE_HEADINGS = {
     "selected topic",
     "source material",
 }
+GENERIC_TOPIC_TITLES = {
+    "topic", "main topic", "summary", "overview", "news", "update", "speaker", "lyrics",
+    "strong", "explicit", "article", "content", "message", "video", "story", "analysis",
+    "commitment",
+}
 
 
 def dependency_status() -> dict[str, bool | str]:
@@ -826,7 +831,16 @@ def sanitize_article_html(raw_html: str) -> str:
         lambda match: match.group(0) if match.group(1).lower() in ALLOWED_ARTICLE_TAGS else "",
         html,
     )
-    return html.strip()
+    normalized_lines: list[str] = []
+    for raw_line in re.split(r"\n+", html):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("<"):
+            normalized_lines.append(line)
+        else:
+            normalized_lines.append(f"<p>{line}</p>")
+    return "\n".join(normalized_lines).strip()
 
 
 def sanitize_inline_html(text: str) -> str:
@@ -844,6 +858,18 @@ def clean_topic_title(title: str) -> str:
     cleaned = strip_html_tags(convert_asterisk_bold_to_html(title or ""))
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -,:;")
     return cleaned[:90].strip() or "Main Topic"
+
+
+def title_needs_editorial_rewrite(title: str) -> bool:
+    cleaned = clean_topic_title(title)
+    lower = cleaned.lower()
+    if lower in GENERIC_TOPIC_TITLES:
+        return True
+    if len(cleaned.split()) < 2:
+        return True
+    if re.fullmatch(r"[A-Za-z]+", cleaned) and len(cleaned) < 12:
+        return True
+    return False
 
 
 def build_editorial_topic_title(keyword: str, support_text: str, index: int) -> str:
@@ -1482,11 +1508,14 @@ Summary:
             title = str(item.get("title", "")).strip()
             explanation = str(item.get("explanation", "")).strip()
             importance = str(item.get("importance", "")).strip()
-            if not title:
+            if not title and not explanation:
                 continue
+            cleaned_title = clean_topic_title(title)
+            if title_needs_editorial_rewrite(cleaned_title):
+                cleaned_title = build_editorial_topic_title(cleaned_title or "Main Topic", explanation or importance, len(details))
             details.append(
                 {
-                    "title": clean_topic_title(title),
+                    "title": cleaned_title,
                     "explanation": sanitize_inline_html(explanation),
                     "importance": sanitize_inline_html(importance),
                 }

@@ -12,6 +12,8 @@ from app import (
     fetch_youtube_transcript_text,
     find_http_urls_in_payload,
     build_local_topic_details,
+    get_topic_details_from_summary,
+    sanitize_article_html,
     is_youtube_url,
     select_any_non_youtube_url,
     select_apify_download_url,
@@ -115,6 +117,24 @@ def test_fallback_article_avoids_banned_meta_phrases():
     assert "Why This Topic Stands Out" not in html
     assert "the selected topic is" not in html.lower()
     assert "this article discusses" not in html.lower()
+
+
+def test_sanitize_article_html_wraps_orphan_text_in_paragraphs():
+    html = sanitize_article_html("<h2>Title</h2>\nPlain paragraph text without tags.")
+    assert "<p>Plain paragraph text without tags.</p>" in html
+
+
+def test_get_topic_details_rewrites_generic_gemini_titles(monkeypatch):
+    monkeypatch.setattr(
+        "app.gemini_generate_text",
+        lambda prompt: '[{"title":"Speaker","explanation":"The explanation covers enduring loyalty and the promises made in the relationship.","importance":"It matters because the language of loyalty shapes the whole message."}]',
+    )
+
+    details = get_topic_details_from_summary("- The lyrics promise unwavering loyalty.\n- The message revolves around fidelity and trust.")
+
+    assert details
+    assert details[0]["title"] != "Speaker"
+    assert len(details[0]["title"].split()) >= 2
 
 
 def test_fetch_youtube_transcript_text_uses_fetch_api(monkeypatch):

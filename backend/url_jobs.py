@@ -3,8 +3,20 @@ from __future__ import annotations
 from typing import Optional
 
 from rq import Retry
+from rq.job import Job
+from rq import get_current_job
 
 from backend.queueing import get_url_analysis_queue
+
+
+def update_job_progress(stage: str, message: str, progress: int) -> None:
+    job = get_current_job()
+    if job is None:
+        return
+    job.meta["stage"] = stage
+    job.meta["message"] = message
+    job.meta["progress"] = max(0, min(progress, 100))
+    job.save_meta()
 
 
 def process_url_analysis_job(
@@ -15,7 +27,13 @@ def process_url_analysis_job(
 ) -> dict[str, object]:
     from backend import app as app_module
 
-    enriched_result = app_module.analyze_url_source(url, query or "Summarize the content")
+    update_job_progress("downloading_source", "Downloading source...", 8)
+    enriched_result = app_module.analyze_url_source(
+        url,
+        query or "Summarize the content",
+        progress_callback=update_job_progress,
+    )
+    update_job_progress("finalizing_output", "Finalizing output...", 98)
     result = {
         "headline": str(enriched_result.get("headline") or "Media summary"),
         "summary": str(enriched_result.get("summary") or ""),
@@ -50,7 +68,7 @@ def enqueue_url_analysis(
     if queue is None:
         raise RuntimeError("Redis queue is not configured.")
 
-    return queue.enqueue(
+    job = queue.enqueue(
         process_url_analysis_job,
         kwargs={
             "url": url,
@@ -63,3 +81,8 @@ def enqueue_url_analysis(
         job_timeout=1800,
         description=f"Analyze URL: {url}",
     )
+    job.meta["stage"] = "downloading_source"
+    job.meta["message"] = "This video is long, so we are transcribing it in parts. Please wait while we process it."
+    job.meta["progress"] = 5
+    job.save_meta()
+    return job

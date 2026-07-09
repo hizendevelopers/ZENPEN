@@ -7,7 +7,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from redis import Redis
-from rq import Queue
+from rq import Queue, Worker
 from rq.job import Job
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -36,6 +36,16 @@ def queue_is_available() -> bool:
     try:
         connection.ping()
         return True
+    except Exception:
+        return False
+
+
+def workers_available() -> bool:
+    connection = get_redis_connection()
+    if connection is None:
+        return False
+    try:
+        return len(Worker.all(connection=connection)) > 0
     except Exception:
         return False
 

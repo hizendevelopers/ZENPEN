@@ -52,6 +52,8 @@ const appState = {
   exportBusy: '',
   exportMessage: '',
   successMessage: '',
+  activeJobId: '',
+  activeJobStage: '',
   sourceMode: 'url',
   formValues: {
     url: '',
@@ -63,6 +65,8 @@ const appState = {
   lastSubmission: null,
   selectedTopics: [],
 };
+
+let analysisPollTimer = null;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -245,12 +249,25 @@ function mapUserFacingError(error) {
   if (lower.includes('invalid email or password')) return 'We could not log you in with those details.';
   if (lower.includes('please provide')) return 'Please provide a supported source before continuing.';
   if (lower.includes('unsupported')) return 'That source type is not supported for this action.';
+  if (lower.includes('video could not be downloaded')) return 'Video could not be downloaded. The source may be private, unavailable, or blocking automated access.';
+  if (lower.includes('transcription failed')) return 'Transcription failed. Please try another source or upload the audio/video file directly.';
+  if (lower.includes('website blocked automated access')) return 'The website blocked automated access. Please try another public URL.';
+  if (lower.includes('could not provide transcript or subtitle text quickly enough')) return 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
   if (lower.includes('youtube video cannot be accessed')) return 'This YouTube video cannot be processed right now. Please try another source or upload the file.';
   if (lower.includes('rate') && lower.includes('busy')) return 'The AI service is busy right now. Please retry in a moment.';
   if (/\b\d{3}\b/.test(message) || lower.includes('traceback') || lower.includes('runtimeerror')) {
     return 'We could not complete that request right now. Please try again.';
   }
   return message;
+}
+
+function stopAnalysisPolling() {
+  if (analysisPollTimer) {
+    clearTimeout(analysisPollTimer);
+    analysisPollTimer = null;
+  }
+  appState.activeJobId = '';
+  appState.activeJobStage = '';
 }
 
 function clearBusyStates() {
@@ -260,6 +277,7 @@ function clearBusyStates() {
   appState.authBusyMessage = '';
   appState.exportBusy = '';
   appState.exportMessage = '';
+  stopAnalysisPolling();
 }
 
 function buildHeader() {
@@ -996,7 +1014,7 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source }) {
     return payload;
   } catch (error) {
     if (error.name === 'AbortError') {
-      throw new Error('The analysis took too long. Please try again with a shorter source or retry in a moment.');
+      throw new Error('This video is long, so we are transcribing it in parts. Please wait while we process it.');
     }
     throw new Error(mapUserFacingError(error));
   } finally {
@@ -1027,6 +1045,54 @@ async function sendGenerateArticlesRequest({ headline, summary, topics, selected
     throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Article generation failed.'));
   }
   return payload.result;
+}
+
+async function fetchAnalysisJob(jobId) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    headers: buildAuthHeaders(),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok && !payload?.queued) {
+    throw new Error(mapUserFacingError(payload?.detail || payload?.error || 'Background analysis failed.'));
+  }
+  return payload;
+}
+
+function startAnalysisPolling(jobId) {
+  stopAnalysisPolling();
+  appState.activeJobId = jobId;
+  const genericProcessingMessage = 'We are processing your source in the background.';
+
+  const poll = async () => {
+    try {
+      const payload = await fetchAnalysisJob(jobId);
+      if (payload.progress?.message && payload.progress.message !== genericProcessingMessage) {
+        appState.busyMessage = payload.progress.message;
+        appState.activeJobStage = payload.progress.stage || '';
+      }
+      if (payload.status === 'completed' && payload.result) {
+        appState.analysisResult = payload.result;
+        appState.selectedTopics = payload.result.topics ? payload.result.topics.slice(0, 3) : [];
+        clearBusyStates();
+        renderApp();
+        return;
+      }
+      if (payload.status === 'failed' || payload.success === false) {
+        appState.analysisError = mapUserFacingError(payload.error || 'The background analysis failed.');
+        clearBusyStates();
+        renderApp();
+        return;
+      }
+      analysisPollTimer = setTimeout(poll, 2500);
+      renderApp();
+    } catch (error) {
+      appState.analysisError = mapUserFacingError(error);
+      clearBusyStates();
+      renderApp();
+    }
+  };
+
+  analysisPollTimer = setTimeout(poll, 1200);
 }
 
 async function sendAuthRequest(path, payload) {
@@ -1137,14 +1203,22 @@ async function handleAnalyzeSubmit(form) {
   appState.successMessage = '';
   appState.busyMode = 'analyzing';
   appState.busyMessage = sourceMode === 'upload'
-    ? 'Uploading and extracting content from your file...'
-    : 'Fetching source, extracting content, and analyzing topics...';
+    ? 'Uploading your media and preparing transcription...'
+    : 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
   renderApp();
 
     try {
       const source = { url, query, file };
       appState.lastSubmission = source;
       const payload = await sendAnalyzeRequest({ generateArticle: false, selectedTopics: [], source });
+      if (payload.queued && payload.jobId) {
+        appState.busyMode = 'analyzing';
+        appState.busyMessage = payload.progress?.message || 'This video is long, so we are transcribing it in parts. Please wait while we process it.';
+        appState.activeJobStage = payload.progress?.stage || '';
+        startAnalysisPolling(payload.jobId);
+        renderApp();
+        return;
+      }
       const result = payload.result;
       appState.analysisResult = result;
       appState.selectedTopics = result.topics ? result.topics.slice(0, 3) : [];

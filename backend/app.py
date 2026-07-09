@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import importlib.util
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -31,13 +33,14 @@ from nltk.tokenize import sent_tokenize
 from dotenv import load_dotenv
 from rq.job import Job
 
-from backend.queueing import fetch_job, queue_is_available, queue_is_configured
+from backend.queueing import fetch_job, queue_is_available, queue_is_configured, workers_available
 from backend.url_jobs import enqueue_url_analysis
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 HISTORY_FILE = BASE_DIR / "backend" / "history.json"
 WHISPER_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "whisper"
+TRANSCRIPT_CACHE_DIR = BASE_DIR / "backend" / ".cache" / "transcripts"
 ENV_FILE = BASE_DIR / ".env"
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -68,8 +71,10 @@ YOUTUBE_PROXY_HTTPS = os.getenv("YOUTUBE_PROXY_HTTPS", "").strip()
 FAST_ANALYSIS_MODE = os.getenv("FAST_ANALYSIS_MODE", "true").strip().lower() not in {"0", "false", "no", "off"}
 FAST_ANALYSIS_TRANSCRIPT_LIMIT = int(os.getenv("FAST_ANALYSIS_TRANSCRIPT_LIMIT", "5000"))
 FAST_ANALYSIS_CHUNK_LIMIT = int(os.getenv("FAST_ANALYSIS_CHUNK_LIMIT", "6"))
-ENABLE_BACKGROUND_URL_JOBS = os.getenv("ENABLE_BACKGROUND_URL_JOBS", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_BACKGROUND_URL_JOBS = os.getenv("ENABLE_BACKGROUND_URL_JOBS", "true").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK = os.getenv("ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
+TRANSCRIPTION_CHUNK_SECONDS = int(os.getenv("TRANSCRIPTION_CHUNK_SECONDS", "600"))
+LONG_TRANSCRIPT_THRESHOLD = int(os.getenv("LONG_TRANSCRIPT_THRESHOLD", "7000"))
 GEMINI_BACKOFF_UNTIL = 0.0
 
 WHISPER_MODEL = None
@@ -204,7 +209,7 @@ def dependency_status() -> dict[str, bool | str]:
         "supabase_configured": supabase_is_configured(),
         "redis_queue_configured": queue_is_configured(),
         "redis_queue_available": queue_is_available(),
-        "background_url_jobs_enabled": ENABLE_BACKGROUND_URL_JOBS,
+        "background_url_jobs_enabled": background_url_jobs_available(),
         "remote_media_download_fallback_enabled": ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
         "remote_media_fallback_available": remote_media_fallback_available(),
         "youtube_proxy_configured": bool(get_proxy_url("http") or get_proxy_url("https")),
@@ -338,6 +343,12 @@ def map_public_error_message(raw_message: str, *, context: str = "analysis") -> 
         return "That file type is not supported. Please upload an audio or video file."
     if "failed to load audio" in lower or ("ffmpeg" in lower and "invalid data found when processing input" in lower):
         return "That file could not be processed as audio or video. Please upload a supported media file."
+    if "video could not be downloaded" in lower:
+        return "Video could not be downloaded. The source may be private, unavailable, or blocking automated access."
+    if "transcription failed" in lower:
+        return "Transcription failed. Please try another source or upload a clearer audio/video file."
+    if "website blocked direct content extraction" in lower:
+        return "The website blocked automated access. Please try another public URL."
     if "youtube" in lower and "requires authenticated cookies" in lower:
         return "This YouTube video cannot be accessed from the server right now. Please try another video or upload the file directly."
     if "rate" in lower and "limit" in lower:
@@ -382,7 +393,7 @@ def get_api_config() -> dict[str, object]:
 
 
 def background_url_jobs_available() -> bool:
-    return ENABLE_BACKGROUND_URL_JOBS and queue_is_available()
+    return ENABLE_BACKGROUND_URL_JOBS and queue_is_available() and workers_available()
 
 
 def get_bearer_token(request: Request) -> Optional[str]:
@@ -1804,6 +1815,104 @@ def transcribe_audio(audio_path: str) -> str:
     return result.get("text", "")
 
 
+def build_transcript_cache_key(source_identifier: str) -> str:
+    digest = hashlib.sha1(source_identifier.encode("utf-8")).hexdigest()
+    return digest
+
+
+def load_cached_transcript(cache_key: str) -> Optional[str]:
+    cache_path = TRANSCRIPT_CACHE_DIR / f"{cache_key}.txt"
+    if not cache_path.exists():
+        return None
+    try:
+        text = cache_path.read_text(encoding="utf-8").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def save_cached_transcript(cache_key: str, transcript: str) -> None:
+    try:
+        TRANSCRIPT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (TRANSCRIPT_CACHE_DIR / f"{cache_key}.txt").write_text(transcript, encoding="utf-8")
+    except Exception:
+        return None
+
+
+def split_audio_for_transcription(audio_path: str, output_dir: str, chunk_seconds: int = TRANSCRIPTION_CHUNK_SECONDS) -> list[str]:
+    ensure_ffmpeg()
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    segment_pattern = str(output_path / "segment_%03d.wav")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        audio_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        segment_pattern,
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        return [audio_path]
+    chunks = sorted(str(path) for path in output_path.glob("segment_*.wav"))
+    return chunks or [audio_path]
+
+
+def transcribe_audio_with_fallback(
+    audio_path: str,
+    *,
+    cache_key: Optional[str] = None,
+    progress_callback=None,
+) -> str:
+    if cache_key:
+        cached = load_cached_transcript(cache_key)
+        if cached:
+            if progress_callback:
+                progress_callback("transcribing_audio", "Using cached transcript.", 45)
+            return cached
+
+    with tempfile.TemporaryDirectory(prefix="transcription-chunks-") as temp_dir:
+        chunks = split_audio_for_transcription(audio_path, temp_dir)
+        transcript_parts: list[str] = []
+        total = len(chunks)
+        for index, chunk_path in enumerate(chunks, start=1):
+            if progress_callback:
+                progress = min(70, 20 + int((index / max(total, 1)) * 45))
+                progress_callback(
+                    "transcribing_audio",
+                    f"Transcribing audio part {index} of {total}...",
+                    progress,
+                )
+            last_error: Optional[Exception] = None
+            for _ in range(2):
+                try:
+                    chunk_text = transcribe_audio(chunk_path).strip()
+                    if chunk_text:
+                        transcript_parts.append(chunk_text)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise RuntimeError(f"Transcription failed for audio part {index} of {total}.") from last_error
+
+    transcript = clean_source_text(" ".join(transcript_parts))
+    if not transcript.strip():
+        raise RuntimeError("Transcription failed to produce readable text.")
+    if cache_key:
+        save_cached_transcript(cache_key, transcript)
+    return transcript
+
+
 def chunk_text(text: str, max_chars: int = 600) -> list[str]:
     try:
         sentences = sent_tokenize(text)
@@ -2298,7 +2407,56 @@ def build_analysis_context(transcript: str, chunks: list[str], query: str) -> st
     return retrieve_context(query, chunks, index)
 
 
-def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[str] = None, query: str = "Summarize the content") -> dict[str, str]:
+def summarize_transcript_chunk(chunk: str, query: str) -> str:
+    prompt = f"""
+You are preparing source notes for article generation.
+
+User request:
+{query}
+
+Transcript chunk:
+{chunk}
+
+Return 3 to 5 concise bullet points that capture the factual ideas, arguments, examples, and entities in this chunk.
+Keep the wording clean and remove filler or transcript noise.
+"""
+    try:
+        raw = gemini_generate_text(prompt)
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        bullets = [line if line.startswith("- ") else f"- {line.lstrip('- ').strip()}" for line in lines[:5]]
+        return "\n".join(bullets)
+    except Exception:
+        return "\n".join(f"- {point}" for point in build_local_summary_points(chunk, max_points=4))
+
+
+def build_chunk_safe_analysis_input(transcript: str, query: str, progress_callback=None) -> str:
+    transcript = clean_source_text(transcript)
+    if len(transcript) <= LONG_TRANSCRIPT_THRESHOLD:
+        return transcript
+
+    transcript_chunks = chunk_text(transcript, max_chars=2800)
+    summaries: list[str] = []
+    total = len(transcript_chunks)
+    for index, chunk in enumerate(transcript_chunks, start=1):
+        if progress_callback:
+            progress = min(88, 72 + int((index / max(total, 1)) * 14))
+            progress_callback(
+                "analyzing_topic",
+                f"Analyzing transcript part {index} of {total}...",
+                progress,
+            )
+        summaries.append(summarize_transcript_chunk(chunk, query))
+    return "\n".join(summaries)
+
+
+def analyze_media(
+    video_path: Optional[str] = None,
+    local_audio_path: Optional[str] = None,
+    query: str = "Summarize the content",
+    *,
+    transcript_cache_key: Optional[str] = None,
+    progress_callback=None,
+) -> tuple[dict[str, str], str]:
     audio_source_path = None
     if local_audio_path:
         audio_source_path = local_audio_path
@@ -2306,56 +2464,79 @@ def analyze_media(video_path: Optional[str] = None, local_audio_path: Optional[s
         with tempfile.TemporaryDirectory(prefix="media-analyzer-extract-") as temp_dir:
             extracted_audio_path = str(Path(temp_dir) / "extracted_audio.wav")
             audio_source_path = extract_audio_from_video(video_path, extracted_audio_path)
-            transcript = clean_source_text(transcribe_audio(audio_source_path))
-            if not transcript.strip():
-                return fallback_summary("", query)
-            chunks = chunk_text(transcript)
+            if progress_callback:
+                progress_callback("transcribing_audio", "Transcribing extracted audio...", 35)
             try:
-                context = build_analysis_context(transcript, chunks, query)
+                transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
+            except RuntimeError as exc:
+                if "readable text" in str(exc).lower():
+                    return fallback_summary("", query), ""
+                raise
+            if not transcript.strip():
+                return fallback_summary("", query), ""
+            if progress_callback:
+                progress_callback("cleaning_transcript", "Cleaning transcript and removing repetition...", 72)
+            analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
+            chunks = chunk_text(analysis_input)
+            try:
+                context = build_analysis_context(analysis_input, chunks, query)
             except Exception:
                 context = " ".join(chunks[:3])
             try:
-                return gemini_rag(context, query)
+                return gemini_rag(context, query), transcript
             except Exception:
-                return fallback_summary(transcript, query)
+                return fallback_summary(transcript, query), transcript
 
     if not audio_source_path:
         raise RuntimeError("No audio source provided or audio extraction failed")
 
-    transcript = clean_source_text(transcribe_audio(audio_source_path))
-    if not transcript.strip():
-        return fallback_summary("", query)
-
-    chunks = chunk_text(transcript)
+    if progress_callback:
+        progress_callback("transcribing_audio", "Transcribing audio...", 35)
     try:
-        context = build_analysis_context(transcript, chunks, query)
+        transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
+    except RuntimeError as exc:
+        if "readable text" in str(exc).lower():
+            return fallback_summary("", query), ""
+        raise
+    if not transcript.strip():
+        return fallback_summary("", query), ""
+
+    if progress_callback:
+        progress_callback("cleaning_transcript", "Cleaning transcript and removing repetition...", 72)
+    analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
+    chunks = chunk_text(analysis_input)
+    try:
+        context = build_analysis_context(analysis_input, chunks, query)
     except Exception:
         context = " ".join(chunks[:3])
 
     try:
-        return gemini_rag(context, query)
+        return gemini_rag(context, query), transcript
     except Exception:
-        return fallback_summary(transcript, query)
+        return fallback_summary(transcript, query), transcript
 
 
-def analyze_text_content(transcript: str, query: str = "Summarize the content") -> dict[str, str]:
+def analyze_text_content(transcript: str, query: str = "Summarize the content", *, progress_callback=None) -> tuple[dict[str, str], str]:
     transcript = clean_source_text(transcript)
     if not transcript.strip():
-        return fallback_summary("", query)
+        return fallback_summary("", query), ""
 
-    chunks = chunk_text(transcript)
+    if progress_callback:
+        progress_callback("cleaning_transcript", "Cleaning transcript and source text...", 72)
+    analysis_input = build_chunk_safe_analysis_input(transcript, query, progress_callback=progress_callback)
+    chunks = chunk_text(analysis_input)
     try:
-        context = build_analysis_context(transcript, chunks, query)
+        context = build_analysis_context(analysis_input, chunks, query)
     except Exception:
         context = " ".join(chunks[:3])
 
     try:
-        return gemini_rag(context, query)
+        return gemini_rag(context, query), transcript
     except Exception:
-        return fallback_summary(transcript, query)
+        return fallback_summary(transcript, query), transcript
 
 
-def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[str, object]:
+def analyze_url_source(url: str, query: str = "Summarize the content", *, progress_callback=None) -> dict[str, object]:
     transcript_override: Optional[str] = None
     temp_audio_path: Optional[str] = None
     source_type = source_kind_from_url(url)
@@ -2364,77 +2545,75 @@ def analyze_url_source(url: str, query: str = "Summarize the content") -> dict[s
         raise RuntimeError("Direct image links are not supported yet. Please use a webpage, YouTube/video URL, or upload an audio/video file.")
 
     if source_type == "web-url":
+        if progress_callback:
+            progress_callback("downloading_source", "Fetching website content...", 15)
         webpage = extract_webpage_content(url)
-        result = analyze_text_content(
+        if progress_callback:
+            progress_callback("analyzing_topic", "Analyzing topic and key ideas...", 78)
+        result, cleaned_transcript = analyze_text_content(
             str(webpage.get("content") or ""),
             query=query or "Summarize the content",
+            progress_callback=progress_callback,
         )
         return enrich_analysis(
             result,
             generate_article=False,
-            source_context=str(webpage.get("content") or ""),
+            source_context=cleaned_transcript or str(webpage.get("content") or ""),
             source_type="web-url",
         )
 
     with tempfile.TemporaryDirectory(prefix="media-analyzer-url-") as temp_dir:
         if source_type == "youtube":
-            transcript_error: Optional[Exception] = None
+            if progress_callback:
+                progress_callback("downloading_source", "Downloading source audio from YouTube...", 12)
             try:
-                transcript_override = fetch_youtube_transcript_text(url)
-            except Exception as exc:
-                transcript_error = exc
-                try:
-                    transcript_override = fetch_youtube_subtitles_text(url, temp_dir)
-                except Exception as subtitle_exc:
-                    if not remote_media_fallback_available():
-                        raise RuntimeError(
-                            "This YouTube video could not provide transcript or subtitle text quickly enough. "
-                            "Please try another video or upload the audio/video file directly for full transcription."
-                        ) from subtitle_exc
-                    try:
-                        temp_audio_path = download_audio(url, temp_dir)
-                    except Exception as download_exc:
-                        raise RuntimeError(
-                            f"YouTube transcript fallback failed: {transcript_error}. "
-                            f"YouTube subtitle fallback failed: {subtitle_exc}. "
-                            f"Media download fallback failed: {download_exc}"
-                        ) from download_exc
-                if transcript_override is None and temp_audio_path is None:
-                    raise RuntimeError(
-                        f"YouTube transcript fallback failed: {transcript_error}. "
-                        f"YouTube subtitle fallback failed: {subtitle_exc}"
-                    ) from subtitle_exc
+                temp_audio_path = download_audio(url, temp_dir)
+            except Exception as download_exc:
+                raise RuntimeError(f"Video could not be downloaded. {download_exc}") from download_exc
         else:
+            if progress_callback:
+                progress_callback("downloading_source", "Downloading source audio...", 12)
             if not remote_media_fallback_available():
                 raise RuntimeError("Direct remote media downloads are disabled in fast mode. Please upload the audio/video file instead.")
             temp_audio_path = download_audio(url, temp_dir)
 
         if transcript_override is not None:
-            result = analyze_text_content(
+            result, cleaned_transcript = analyze_text_content(
                 clean_source_text(transcript_override),
                 query=query or "Summarize the content",
+                progress_callback=progress_callback,
             )
         else:
-            result = analyze_media(
+            result, cleaned_transcript = analyze_media(
                 local_audio_path=temp_audio_path,
                 query=query or "Summarize the content",
+                transcript_cache_key=build_transcript_cache_key(url),
+                progress_callback=progress_callback,
             )
 
+    if progress_callback:
+        progress_callback("finalizing_output", "Finalizing output and preparing topics...", 96)
     return enrich_analysis(
         result,
         generate_article=False,
-        source_context=transcript_override or result.get("summary", ""),
+        source_context=cleaned_transcript or transcript_override or result.get("summary", ""),
         source_type="youtube" if source_type == "youtube" else "media-url",
     )
 
 
 def serialize_job_status(job: Job) -> dict[str, object]:
+    progress_payload = {
+        "stage": str(job.meta.get("stage") or "queued"),
+        "message": str(job.meta.get("message") or "We are processing your source in the background."),
+        "progress": int(job.meta.get("progress") or 0),
+    }
     status = job.get_status(refresh=True)
     if status == "finished":
         return {
             "success": True,
             "status": "completed",
             "result": job.result,
+            "progress": {**progress_payload, "progress": 100, "stage": "completed", "message": "Analysis completed."},
         }
 
     if status == "failed":
@@ -2445,12 +2624,15 @@ def serialize_job_status(job: Job) -> dict[str, object]:
             "success": False,
             "status": "failed",
             "error": last_line or "Background job failed.",
+            "progress": progress_payload,
         }
 
     return {
         "success": True,
         "status": status,
         "queued": True,
+        "jobId": job.id,
+        "progress": progress_payload,
     }
 
 
@@ -2686,6 +2868,26 @@ async def analyze_endpoint(
 
     try:
         user = resolve_supabase_user(request)
+        if url and not file and background_url_jobs_available():
+            job = enqueue_url_analysis(
+                url=url,
+                query=query or "Summarize the content",
+                user_id=str(user["id"]) if user else None,
+            )
+            return JSONResponse(
+                {
+                    "success": True,
+                    "queued": True,
+                    "jobId": job.id,
+                    "status": "queued",
+                    "progress": {
+                        "stage": "downloading_source",
+                        "message": "This video is long, so we are transcribing it in parts. Please wait while we process it.",
+                        "progress": 5,
+                    },
+                },
+                status_code=202,
+            )
         with tempfile.TemporaryDirectory(prefix="media-analyzer-") as temp_dir:
             temp_dir_path = Path(temp_dir)
             temp_audio_path: Optional[str] = None
@@ -2704,11 +2906,11 @@ async def analyze_endpoint(
                     )
                 else:
                     temp_audio_path = str(upload_path)
-                result = analyze_media(
+                result, cleaned_transcript = analyze_media(
                     local_audio_path=temp_audio_path,
                     query=query or "Summarize the content",
                 )
-                source_context = str(result.get("summary") or "")
+                source_context = cleaned_transcript or str(result.get("summary") or "")
                 enriched_result = enrich_analysis(
                     result,
                     generate_article=generate_article,

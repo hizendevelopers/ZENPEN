@@ -90,7 +90,7 @@ def test_extract_youtube_video_id_supports_multiple_formats():
 
 
 def test_analyze_text_content_uses_fallback_summary_when_empty():
-    result = analyze_text_content('', 'Summarize')
+    result, _ = analyze_text_content('', 'Summarize')
     assert 'Summarize' in result['headline']
 
 
@@ -181,9 +181,9 @@ def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp
 
 
 def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
-    monkeypatch.setattr('app.queue_is_available', lambda: False)
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('download failed')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript from YouTube captions.')
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Transcript from YouTube captions.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
@@ -202,9 +202,9 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch):
 
 
 def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch):
-    monkeypatch.setattr('app.queue_is_available', lambda: False)
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
@@ -291,7 +291,7 @@ def test_frontend_deep_links_fallback_to_index():
 
 
 def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
-    monkeypatch.setattr('app.queue_is_available', lambda: False)
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
@@ -316,7 +316,7 @@ def test_analyze_endpoint_returns_summary_for_uploaded_audio(monkeypatch):
 
 
 def test_analyze_endpoint_falls_back_when_transcript_is_empty(monkeypatch):
-    monkeypatch.setattr('app.queue_is_available', lambda: False)
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: '')
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Main topic', 'explanation': 'Explanation', 'importance': 'Importance'}
@@ -336,7 +336,7 @@ def test_analyze_endpoint_falls_back_when_transcript_is_empty(monkeypatch):
 
 
 def test_analyze_endpoint_generates_articles_when_requested(monkeypatch):
-    monkeypatch.setattr('app.queue_is_available', lambda: False)
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'This is a short transcript. It has two sentences.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
@@ -383,7 +383,8 @@ def test_analyze_endpoint_rejects_unsupported_upload_type():
 
 
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'},
@@ -396,10 +397,9 @@ def test_analyze_url_source_returns_topics_without_articles(monkeypatch):
     assert result['articles'] == []
 
 
-def test_analyze_url_source_uses_subtitles_before_media_download(monkeypatch):
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
-    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: 'Subtitle transcript available immediately.')
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
+def test_analyze_url_source_downloads_and_transcribes_youtube(monkeypatch):
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: 'Subtitle transcript available immediately.')
     monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
     monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
         {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
@@ -436,14 +436,12 @@ def test_analyze_url_source_fails_fast_when_youtube_text_is_unavailable(monkeypa
     monkeypatch.setattr('app.YOUTUBE_PROXY_HTTP', '')
     monkeypatch.setattr('app.YOUTUBE_PROXY_HTTPS', '')
     monkeypatch.setattr('app.YOUTUBE_PROXY_URL', '')
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
-    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('no subtitles')))
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('download should not be called')))
 
     try:
         analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
     except RuntimeError as exc:
-        assert 'could not provide transcript or subtitle text quickly enough' in str(exc)
+        assert 'Video could not be downloaded' in str(exc)
     else:
         raise AssertionError('Expected RuntimeError')
 
@@ -460,29 +458,30 @@ def test_build_topic_details_bundle_deduplicates_titles(monkeypatch):
     assert [item['title'] for item in details] == ['Topic A', 'Topic B']
 
 
-def test_analyze_endpoint_stays_synchronous_even_if_queue_is_available(monkeypatch):
+def test_analyze_endpoint_queues_url_job_when_background_workers_are_available(monkeypatch):
+    class FakeJob:
+        id = 'job-123'
+
     monkeypatch.setattr('app.background_url_jobs_available', lambda: True)
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
-    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
-        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
-    ])
+    monkeypatch.setattr('app.enqueue_url_analysis', lambda **kwargs: FakeJob())
 
     response = client.post(
         '/api/analyze',
         data={'url': 'https://www.youtube.com/watch?v=abc123', 'query': 'Summarize'},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.json()
     assert payload['success'] is True
-    assert 'queued' not in payload
-    assert payload['result']['topics'] == ['Topic A']
+    assert payload['queued'] is True
+    assert payload['jobId'] == 'job-123'
+    assert payload['progress']['stage'] == 'downloading_source'
 
 
 def test_job_status_endpoint_returns_completed_result(monkeypatch):
     class FakeJob:
         result = {'headline': 'Ready'}
+        meta = {'stage': 'analyzing_topic', 'message': 'Analyzing topic...', 'progress': 84}
 
         def get_status(self, refresh=True):
             return 'finished'
@@ -559,7 +558,7 @@ def test_map_public_error_message_hides_raw_codes():
 
 def test_map_public_error_message_handles_site_block():
     message = map_public_error_message('That website blocked direct content extraction. Please try another public URL or upload the media file.')
-    assert 'blocked direct content extraction' in message
+    assert 'blocked automated access' in message
 
 
 def test_remote_media_fallback_available_when_apify_or_proxy_exists(monkeypatch):

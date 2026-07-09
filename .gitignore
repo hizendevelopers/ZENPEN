@@ -1,9 +1,11 @@
 .env
+.env.*
 .venv/
 .pytest_cache/
 __pycache__/
 *.py[cod]
 *.log
+backend/history.json
 backend/server_stdout.log
 backend/server_stderr.log
 backend/test_tone.wav

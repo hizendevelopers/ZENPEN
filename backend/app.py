@@ -93,6 +93,7 @@ ENABLE_DIRECT_GEMINI_YOUTUBE_ANALYSIS = os.getenv("ENABLE_DIRECT_GEMINI_YOUTUBE_
 ANALYSIS_JOB_MAX_SECONDS = int(os.getenv("ANALYSIS_JOB_MAX_SECONDS", "480"))
 ANALYSIS_JOB_STALE_SECONDS = int(os.getenv("ANALYSIS_JOB_STALE_SECONDS", "150"))
 GEMINI_BACKOFF_UNTIL = 0.0
+APP_ENV = os.getenv("APP_ENV", os.getenv("ENV", "development")).strip().lower()
 
 logger = logging.getLogger("zenpen.performance")
 if not logger.handlers:
@@ -150,6 +151,10 @@ class ExportArticleRequest(BaseModel):
 class AnalyzeYouTubeRequest(BaseModel):
     url: str
     query: str = "Give breaking news and main points"
+
+
+def is_development_mode() -> bool:
+    return APP_ENV not in {"production", "prod"}
 
 
 class StageProfiler:
@@ -1787,6 +1792,7 @@ def fetch_youtube_subtitles_text(url: str, output_dir: str) -> str:
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     cookies_file = maybe_write_youtube_cookies_file(output_dir_path)
+    logger.info("youtube-subtitles | extraction_started | url=%s", url)
 
     def build_subtitle_opts(proxy_url: Optional[str]) -> dict[str, object]:
         opts: dict[str, object] = {
@@ -1839,6 +1845,7 @@ def fetch_youtube_subtitles_text(url: str, output_dir: str) -> str:
         subtitle_text = clean_vtt_caption_text(subtitle_file.read_text(encoding="utf-8", errors="ignore"))
         if len(subtitle_text) > len(best_text):
             best_text = subtitle_text
+    logger.info("youtube-subtitles | extraction_finished | files=%s | chars=%s", len(subtitle_files), len(best_text))
     if not best_text:
         raise RuntimeError("YouTube subtitle download succeeded, but no readable subtitle text was found.")
     return best_text
@@ -3218,6 +3225,8 @@ def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress
 
 def analyze_youtube_source(url: str, query: str = "Summarize the content", *, progress_callback=None) -> dict[str, object]:
     profiler = StageProfiler(f"youtube-analysis:{url}")
+    video_id = extract_youtube_video_id(url) or "unknown"
+    logger.info("youtube-analysis-stage | video_id_extracted | url=%s | video_id=%s", url, video_id)
     analysis_cache_key = build_content_cache_key("youtube-analysis", f"{url}|{query}")
     with profiler.stage("analysis_cache_lookup"):
         cached = load_cached_analysis_result(analysis_cache_key)
@@ -3775,6 +3784,7 @@ async def analyze_source_alias_endpoint(
     url: Optional[str] = Form(None),
     query: Optional[str] = Form("Summarize the content"),
     file: Optional[UploadFile] = File(None),
+    transcript_text: Optional[str] = Form(None),
     generate_article: bool = Form(False),
     article_count: int = Form(1),
     selected_topics: Optional[str] = Form(None),
@@ -3786,6 +3796,7 @@ async def analyze_source_alias_endpoint(
         url=url,
         query=query,
         file=file,
+        transcript_text=transcript_text,
         generate_article=generate_article,
         article_count=article_count,
         selected_topics=selected_topics,
@@ -3882,6 +3893,7 @@ async def analyze_endpoint(
     url: Optional[str] = Form(None),
     query: Optional[str] = Form("Summarize the content"),
     file: Optional[UploadFile] = File(None),
+    transcript_text: Optional[str] = Form(None),
     generate_article: bool = Form(False),
     article_count: int = Form(1),
     selected_topics: Optional[str] = Form(None),
@@ -3889,8 +3901,9 @@ async def analyze_endpoint(
     target_audience: str = Form("General readers"),
 ) -> JSONResponse:
     profiler = StageProfiler("analyze-endpoint")
-    if not file and not url:
-        raise HTTPException(status_code=400, detail="Please provide a URL or upload an audio/video file")
+    transcript_text = (transcript_text or "").strip()
+    if not file and not url and not transcript_text:
+        raise HTTPException(status_code=400, detail="Please provide a URL, upload an audio/video file, or paste a transcript.")
     if file:
         content_type = (file.content_type or "").lower()
         suffix = Path(file.filename or "").suffix.lower()
@@ -3901,7 +3914,7 @@ async def analyze_endpoint(
 
     try:
         user = resolve_supabase_user(request)
-        if url and not file and background_url_jobs_available():
+        if url and not file and not transcript_text and background_url_jobs_available():
             job = enqueue_url_analysis(
                 url=url,
                 query=query or "Summarize the content",
@@ -3928,9 +3941,28 @@ async def analyze_endpoint(
             topic_list = [topic.strip() for topic in (selected_topics or "").split(",") if topic.strip()]
             source_context = ""
             source_cache_key = ""
-            detected_source_type = "upload" if file else source_kind_from_url(url or "")
+            detected_source_type = "upload" if file else ("pasted-transcript" if transcript_text else source_kind_from_url(url or ""))
 
-            if file:
+            if transcript_text:
+                result, cleaned_transcript = analyze_text_content(
+                    transcript_text,
+                    query=query or "Summarize the content",
+                )
+                source_context = cleaned_transcript or transcript_text
+                source_cache_key = build_content_cache_key("source-context", f"pasted-transcript|{source_context}")
+                save_cached_source_content(source_cache_key, {"content": source_context, "source_type": "pasted-transcript"})
+                enriched_result = enrich_analysis(
+                    result,
+                    generate_article=generate_article,
+                    selected_topics=topic_list or None,
+                    article_count=article_count,
+                    article_type=article_type,
+                    target_audience=target_audience,
+                    source_context=source_context,
+                    source_type="pasted-transcript",
+                    source_cache_key=source_cache_key,
+                )
+            elif file:
                 suffix = Path(file.filename or "upload.wav").suffix.lower() or ".wav"
                 upload_path = temp_dir_path / f"upload{suffix}"
                 with profiler.stage("source_fetch_download"):
@@ -3983,8 +4015,8 @@ async def analyze_endpoint(
                         source_cache_key=source_cache_key,
                     )
                     enriched_result["topics"] = existing_topics
-            source = "uploaded-file" if file else ("youtube-url" if detected_source_type == "youtube" else "remote-url")
-            source_type = "upload" if file else "url"
+            source = "pasted-transcript" if transcript_text else ("uploaded-file" if file else ("youtube-url" if detected_source_type == "youtube" else "remote-url"))
+            source_type = "transcript" if transcript_text else ("upload" if file else "url")
             result_for_history = {
                 "headline": str(enriched_result.get("headline") or "Media summary"),
                 "summary": str(enriched_result.get("summary") or ""),
@@ -4010,7 +4042,14 @@ async def analyze_endpoint(
         raise
     except Exception as exc:
         print(f"[analyze_endpoint] {exc}", file=sys.stderr)
-        return JSONResponse({"success": False, "error": map_public_error_message(str(exc))}, status_code=500)
+        payload = {"success": False, "error": map_public_error_message(str(exc))}
+        if is_development_mode():
+            payload["debug"] = {
+                "url": url,
+                "source_type": "pasted-transcript" if transcript_text else ("upload" if file else source_kind_from_url(url or "")),
+                "raw_error": str(exc),
+            }
+        return JSONResponse(payload, status_code=500)
 
 
 @app.get("/{full_path:path}")

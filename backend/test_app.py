@@ -555,6 +555,27 @@ def test_analyze_endpoint_rejects_unsupported_upload_type():
     assert response.json()['detail'] == 'Unsupported file type. Please upload an audio or video file.'
 
 
+def test_analyze_endpoint_accepts_pasted_transcript(monkeypatch):
+    monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Transcript-based heading',
+        'summary': 'Transcript-based summary.',
+        'key_points': ['Point one'],
+        'topics': [{'title': 'Transcript Topic', 'points': [{'label': 'Point', 'description': 'Built from pasted transcript.'}]}],
+    })
+
+    response = client.post(
+        '/api/analyze',
+        data={'query': 'Summarize', 'transcript_text': 'This is the pasted transcript. It discusses systems, planning, and execution.'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['success'] is True
+    assert payload['result']['headline'] == 'Transcript-based heading'
+    assert payload['result']['topics'] == ['Transcript Topic']
+
+
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})

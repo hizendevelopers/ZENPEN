@@ -252,8 +252,8 @@ function mapUserFacingError(error) {
   if (lower.includes('unsupported')) return 'That source type is not supported for this action.';
   if (lower.includes('video could not be downloaded')) return 'Video could not be downloaded. The source may be private or unavailable.';
   if (lower.includes('source is private or unavailable')) return 'Source is private or unavailable.';
-  if (lower.includes('gemini could not analyze the video directly')) return 'Direct video analysis failed. Trying audio transcription fallback may be required.';
-  if (lower.includes('direct video analysis took too long')) return 'Direct video analysis took too long. Trying captions/transcript fallback may help.';
+  if (lower.includes('gemini could not analyze the video directly')) return 'Direct video analysis failed. Extracting transcript...';
+  if (lower.includes('direct video analysis took too long')) return 'Direct video analysis took too long. Extracting transcript...';
   if (lower.includes('transcription failed')) return 'Transcription failed. Please try another source or upload the audio/video file directly.';
   if (lower.includes('captions were not available')) return 'Captions were not available. Trying audio transcription...';
   if (lower.includes('website blocked automated access')) return 'The website blocked automated access. Please try another public URL.';
@@ -288,7 +288,7 @@ function startBusyStatusTimer(mode) {
   const stagesByMode = {
     analyzing: [
       { delay: 8000, message: 'Extracting headline, summary, and topics...' },
-      { delay: 22000, message: 'Analysis is taking longer than expected. Please retry or use a shorter source.' },
+      { delay: 22000, message: 'This is taking longer than usual. We are still processing the source.' },
     ],
     articles: [
       { delay: 8000, message: 'Polishing article...' },

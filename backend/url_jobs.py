@@ -30,7 +30,7 @@ def process_url_analysis_job(
     from backend import app as app_module
 
     if app_module.is_youtube_url(url):
-        update_job_progress("analyzing_video", "Analyzing video with Gemini...", 8)
+        update_job_progress("direct_gemini", "Analyzing video with Gemini...", 8)
     else:
         update_job_progress("downloading_source", "Downloading source...", 8)
     enriched_result = app_module.analyze_url_source(
@@ -88,7 +88,7 @@ def enqueue_url_analysis(
         description=f"Analyze URL: {url}",
     )
     now = time.time()
-    job.meta["stage"] = "analyzing_video" if is_youtube else "downloading_source"
+    job.meta["stage"] = "direct_gemini" if is_youtube else "downloading_source"
     job.meta["message"] = "Analyzing video with Gemini..." if is_youtube else "Preparing source..."
     job.meta["progress"] = 5
     job.meta["created_at_ts"] = now

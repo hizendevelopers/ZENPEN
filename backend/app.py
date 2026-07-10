@@ -3196,7 +3196,7 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content", 
 def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress_callback=None) -> tuple[dict[str, str], str]:
     with tempfile.TemporaryDirectory(prefix="media-analyzer-youtube-fallback-") as temp_dir:
         if progress_callback:
-            progress_callback("fallback_transcription", "Direct analysis and captions fallback failed. Trying audio transcription fallback...", 38)
+            progress_callback("audio_fallback", "Captions were not available. Transcribing audio...", 38)
         temp_audio_path = run_with_timeout(
             "Video download",
             min(120, YOUTUBE_FALLBACK_TIMEOUT),
@@ -3232,7 +3232,7 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
     direct_failure: Optional[Exception] = None
 
     if progress_callback:
-        progress_callback("analyzing_video", "Analyzing video with Gemini...", 12)
+        progress_callback("direct_gemini", "Analyzing video with Gemini...", 12)
 
     with profiler.stage("source_fetch_download"):
         metadata = run_with_timeout("YouTube metadata analysis", 35, fetch_youtube_metadata, url)
@@ -3276,8 +3276,8 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
             )
             if progress_callback:
                 progress_callback(
-                    "transcription",
-                    "Direct video analysis failed. Trying captions/transcript fallback...",
+                    "captions_fallback",
+                    "Direct video analysis took too long. Extracting transcript...",
                     28,
                 )
 
@@ -3307,7 +3307,7 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
 
         if transcript_text.strip():
             if progress_callback:
-                progress_callback("extracting_topics", "Extracting headline, summary, and main topics...", 68)
+                progress_callback("topic_generation", "Transcript found. Generating heading, summary, and topics...", 68)
             with profiler.stage("transcript_cleaning"):
                 source_context = build_youtube_source_text(metadata, transcript_text)
             with profiler.stage("analysis_generation"):
@@ -3322,7 +3322,7 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
             source_context = source_context
         else:
             if progress_callback:
-                progress_callback("fallback_transcription", "Captions were not available. Trying audio transcription...", 38)
+                progress_callback("audio_fallback", "Captions were not available. Transcribing audio...", 38)
             if not remote_media_fallback_available():
                 raise RuntimeError("Gemini direct analysis failed and no captions/transcript were available.") from captions_error or direct_exc
             result, cleaned_transcript = analyze_youtube_via_transcription_fallback(url, query or "Summarize the content", progress_callback=progress_callback)
@@ -3445,7 +3445,7 @@ def serialize_job_status(job: Job) -> dict[str, object]:
     stale_seconds = max(0, int(now - updated_at_ts))
 
     if status not in {"finished", "failed"}:
-        if age_seconds >= ANALYSIS_JOB_MAX_SECONDS or stale_seconds >= ANALYSIS_JOB_STALE_SECONDS:
+        if age_seconds >= ANALYSIS_JOB_MAX_SECONDS:
             logger.warning(
                 "analysis-job-timeout | job_id=%s | status=%s | age=%ss | stale=%ss | stage=%s",
                 job.id,
@@ -3458,13 +3458,39 @@ def serialize_job_status(job: Job) -> dict[str, object]:
                 "success": False,
                 "status": "failed",
                 "reason": "timeout",
-                "message": "Direct video analysis took too long. Please retry or use transcript fallback.",
-                "error": "Direct video analysis took too long. Please retry or use transcript fallback.",
+                "message": "We could not extract reliable content from this video. Please upload the video/audio file or try another link.",
+                "error": "We could not extract reliable content from this video. Please upload the video/audio file or try another link.",
                 "progress": {
                     **progress_payload,
                     "stage": "failed",
-                    "message": "Direct video analysis took too long. Please retry or use transcript fallback.",
+                    "message": "We could not extract reliable content from this video. Please upload the video/audio file or try another link.",
                 },
+            }
+        if progress_payload["stage"] == "direct_gemini" and stale_seconds >= YOUTUBE_DIRECT_ANALYSIS_TIMEOUT:
+            logger.info(
+                "analysis-job-stage-promote | job_id=%s | from=%s | to=%s | stale=%ss",
+                job.id,
+                progress_payload["stage"],
+                "captions_fallback",
+                stale_seconds,
+            )
+            progress_payload = {
+                "stage": "captions_fallback",
+                "message": "Direct video analysis took too long. Extracting transcript...",
+                "progress": max(progress_payload["progress"], 28),
+            }
+        elif progress_payload["stage"] == "captions_fallback" and stale_seconds >= max(30, YOUTUBE_TRANSCRIPT_TIMEOUT):
+            logger.info(
+                "analysis-job-stage-promote | job_id=%s | from=%s | to=%s | stale=%ss",
+                job.id,
+                progress_payload["stage"],
+                "audio_fallback",
+                stale_seconds,
+            )
+            progress_payload = {
+                "stage": "audio_fallback",
+                "message": "Captions were not available. Transcribing audio...",
+                "progress": max(progress_payload["progress"], 38),
             }
     if status == "finished":
         return {
@@ -3718,7 +3744,7 @@ def analyze_youtube_endpoint(payload: AnalyzeYouTubeRequest, request: Request) -
                     "jobId": job.id,
                     "status": "queued",
                     "progress": {
-                        "stage": "analyzing_video",
+                        "stage": "direct_gemini",
                         "message": "Analyzing video with Gemini...",
                         "progress": 6,
                     },
@@ -3881,7 +3907,7 @@ async def analyze_endpoint(
                     "jobId": job.id,
                     "status": "queued",
                     "progress": {
-                        "stage": "analyzing_video" if is_youtube else "downloading_source",
+                        "stage": "direct_gemini" if is_youtube else "downloading_source",
                         "message": "Analyzing video with Gemini..." if is_youtube else "Preparing source...",
                         "progress": 5,
                     },

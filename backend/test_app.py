@@ -3,7 +3,9 @@ import io
 from fastapi.testclient import TestClient
 
 from app import (
+    ANALYSIS_JOB_MAX_SECONDS,
     ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
+    YOUTUBE_DIRECT_ANALYSIS_TIMEOUT,
     analyze_text_content,
     app,
     analyze_youtube_source,
@@ -651,13 +653,34 @@ def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_
     assert result['direct_analysis'] is True
 
 
-def test_serialize_job_status_marks_stale_jobs_as_timeout(monkeypatch):
+def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_captions_fallback(monkeypatch):
     class FakeJob:
         id = 'job-1'
         meta = {
-            'stage': 'analyzing_video',
+            'stage': 'direct_gemini',
             'message': 'Analyzing video with Gemini...',
             'progress': 12,
+            'created_at_ts': 900000,
+            'updated_at_ts': 900000,
+        }
+
+        def get_status(self, refresh=True):
+            return 'started'
+
+    monkeypatch.setattr('app.time.time', lambda: 900000 + YOUTUBE_DIRECT_ANALYSIS_TIMEOUT + 5)
+    payload = serialize_job_status(FakeJob())
+    assert payload['status'] == 'started'
+    assert payload['progress']['stage'] == 'captions_fallback'
+    assert 'Extracting transcript' in payload['progress']['message']
+
+
+def test_serialize_job_status_marks_overall_job_timeout_as_failed(monkeypatch):
+    class FakeJob:
+        id = 'job-1'
+        meta = {
+            'stage': 'audio_fallback',
+            'message': 'Captions were not available. Transcribing audio...',
+            'progress': 38,
             'created_at_ts': 0,
             'updated_at_ts': 0,
         }
@@ -665,7 +688,7 @@ def test_serialize_job_status_marks_stale_jobs_as_timeout(monkeypatch):
         def get_status(self, refresh=True):
             return 'started'
 
-    monkeypatch.setattr('app.time.time', lambda: 999999)
+    monkeypatch.setattr('app.time.time', lambda: ANALYSIS_JOB_MAX_SECONDS + 999)
     payload = serialize_job_status(FakeJob())
     assert payload['status'] == 'failed'
     assert payload['reason'] == 'timeout'
@@ -744,7 +767,7 @@ def test_analyze_endpoint_queues_url_job_when_background_workers_are_available(m
     assert payload['success'] is True
     assert payload['queued'] is True
     assert payload['jobId'] == 'job-123'
-    assert payload['progress']['stage'] == 'analyzing_video'
+    assert payload['progress']['stage'] == 'direct_gemini'
 
 
 def test_job_status_endpoint_returns_completed_result(monkeypatch):

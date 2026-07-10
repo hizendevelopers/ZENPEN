@@ -1202,6 +1202,14 @@ def sanitize_inline_html(text: str) -> str:
     return html.strip()
 
 
+def remove_timestamps(text: str) -> str:
+    cleaned = re.sub(r"\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*\]", " ", text or "")
+    cleaned = re.sub(r"\(\s*\d{1,2}:\d{2}(?::\d{2})?\s*\)", " ", cleaned)
+    cleaned = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
 def clean_source_text(text: str) -> str:
     normalized = unescape((text or "").replace("\r", "\n"))
     normalized = re.sub(r"<[^>]+>", " ", normalized)
@@ -1310,8 +1318,23 @@ def extract_webpage_content(url: str) -> dict[str, object]:
     return payload
 
 
-def build_topic_details_bundle(summary_text: str) -> tuple[list[dict[str, str]], bool]:
-    raw_details = get_topic_details_from_summary(summary_text)
+def sanitize_topic_point(point: dict[str, object]) -> Optional[dict[str, str]]:
+    if not isinstance(point, dict):
+        return None
+    label = sanitize_inline_html(str(point.get("label", "")).strip())
+    description = sanitize_inline_html(str(point.get("description", "")).strip())
+    label = remove_timestamps(label)
+    description = remove_timestamps(description)
+    if not label and not description:
+        return None
+    return {
+        "label": label or "Key idea",
+        "description": description,
+    }
+
+
+def build_topic_details_bundle(summary_text: str, structured_topics: Optional[list[dict[str, object]]] = None) -> tuple[list[dict[str, object]], bool]:
+    raw_details = structured_topics or get_topic_details_from_summary(summary_text)
     details: list[dict[str, str]] = []
     seen_titles: set[str] = set()
     for item in raw_details:
@@ -1320,11 +1343,19 @@ def build_topic_details_bundle(summary_text: str) -> tuple[list[dict[str, str]],
         if not title or key in seen_titles:
             continue
         seen_titles.add(key)
+        points = []
+        for raw_point in item.get("points", []) if isinstance(item, dict) else []:
+            cleaned_point = sanitize_topic_point(raw_point)
+            if cleaned_point:
+                points.append(cleaned_point)
+        explanation = remove_timestamps(sanitize_inline_html(str(item.get("explanation", ""))))
+        importance = remove_timestamps(sanitize_inline_html(str(item.get("importance", ""))))
         details.append(
             {
                 "title": title,
-                "explanation": sanitize_inline_html(str(item.get("explanation", ""))),
-                "importance": sanitize_inline_html(str(item.get("importance", ""))),
+                "explanation": explanation,
+                "importance": importance,
+                "points": points,
             }
         )
     used_fallback = all(title_needs_editorial_rewrite(item.get("title", "")) for item in details[: min(3, len(details))]) if details else True
@@ -2251,7 +2282,28 @@ def build_local_summary_points(transcript: str, max_points: int = 4) -> list[str
     return selected[:max_points]
 
 
-def build_local_topic_details(summary_text: str) -> list[dict[str, str]]:
+def build_local_topic_points(topic_title: str, support_text: str, importance_seed: str) -> list[dict[str, str]]:
+    seed_sentences = split_sentences(f"{support_text} {importance_seed}") or [support_text or importance_seed]
+    labels = [
+        "Core argument",
+        "Why it matters",
+        "Practical relevance",
+    ]
+    points: list[dict[str, str]] = []
+    for index, sentence in enumerate(seed_sentences[:3]):
+        cleaned_sentence = remove_timestamps(sanitize_inline_html(sentence[:260].strip()))
+        if not cleaned_sentence:
+            continue
+        points.append(
+            {
+                "label": labels[index] if index < len(labels) else f"{topic_title} insight",
+                "description": cleaned_sentence,
+            }
+        )
+    return points
+
+
+def build_local_topic_details(summary_text: str) -> list[dict[str, object]]:
     points = [line[2:].strip() for line in summary_text.splitlines() if line.startswith("- ")]
     if len(points) > 1 and len(points[0].split()) < 10:
         points = points[1:]
@@ -2266,18 +2318,25 @@ def build_local_topic_details(summary_text: str) -> list[dict[str, str]]:
         details.append(
             {
                 "title": title,
-                "explanation": sanitize_inline_html(
+                "explanation": remove_timestamps(sanitize_inline_html(
                     f"{support_text[:220].strip()} This angle gives the writer enough substance to build a full article instead of a thin summary."
-                ),
-                "importance": sanitize_inline_html(
+                )),
+                "importance": remove_timestamps(sanitize_inline_html(
                     f"It matters because it opens a clearer view of the argument, the stakes, and the examples that give {keyword.lower()} real weight. {importance_seed[:140].strip()}"
-                ),
+                )),
+                "points": build_local_topic_points(title, support_text, importance_seed),
             }
         )
     return details or [{
         "title": "The Main Argument Behind the Story",
         "explanation": sanitize_inline_html("The source centers on one clearly expandable issue with enough direction, detail, and tension to support a professional article."),
         "importance": sanitize_inline_html("It matters because it captures the strongest idea in the material and gives the writer a solid editorial angle to build on."),
+        "points": [
+            {
+                "label": "Main lesson",
+                "description": "The source presents one central idea strongly enough to support a focused, publication-ready article.",
+            }
+        ],
     }]
 
 
@@ -2297,27 +2356,40 @@ def fallback_topics(summary_text: str) -> list[str]:
     return extract_top_keywords(topic_source, limit=5) or ["Main Topic"]
 
 
-def get_topic_details_from_summary(summary_text: str) -> list[dict[str, str]]:
+def get_topic_details_from_summary(summary_text: str) -> list[dict[str, object]]:
     prompt = f"""
-You are analyzing a video summary for an article generation tool.
+You are an expert video analyst and editorial researcher.
 
-Create 5 to 8 article topic options based strictly on the summary below.
+Analyze the summary below and create 5 to 8 meaningful topic options based strictly on the actual source.
 Each topic must include:
 - title
 - explanation
 - importance
+- points: 2 to 3 short sub-points with:
+  - label
+  - description
 
 Rules:
-- The title must sound like a real article angle, not a single-word label.
+- The title must sound like a real analytical angle, not a one-word label.
 - Avoid generic titles such as "News", "Update", "Main Topic", or "Overview".
 - Keep titles specific, useful, and directly connected to the summary.
-- Explanation must briefly say what the article would focus on.
-- Importance must explain why the angle deserves coverage.
+- Explanation must briefly say what the topic means in the source.
+- Importance must explain why the angle matters.
+- Each point should feel like deep analysis, not a transcript line.
+- Do not include timestamps.
+- Do not repeat the same idea in different wording.
 
 Return valid JSON only in this shape:
 [
-  {{"title": "Topic title", "explanation": "Short explanation", "importance": "Why it matters"}},
-  {{"title": "Topic title", "explanation": "Short explanation", "importance": "Why it matters"}}
+  {{
+    "title": "Topic title",
+    "explanation": "Short explanation",
+    "importance": "Why it matters",
+    "points": [
+      {{"label": "Sub-point heading", "description": "Short explanation based on the source"}},
+      {{"label": "Sub-point heading", "description": "Short explanation based on the source"}}
+    ]
+  }}
 ]
 
 Summary:
@@ -2328,7 +2400,7 @@ Summary:
         payload = json.loads(raw_text)
         if not isinstance(payload, list):
             raise ValueError("Topic details payload must be a list.")
-        details: list[dict[str, str]] = []
+        details: list[dict[str, object]] = []
         for item in payload:
             if not isinstance(item, dict):
                 continue
@@ -2340,11 +2412,17 @@ Summary:
             cleaned_title = clean_topic_title(title)
             if title_needs_editorial_rewrite(cleaned_title):
                 cleaned_title = build_editorial_topic_title(cleaned_title or "Main Topic", explanation or importance, len(details))
+            points = []
+            for raw_point in item.get("points", []) if isinstance(item.get("points", []), list) else []:
+                cleaned_point = sanitize_topic_point(raw_point)
+                if cleaned_point:
+                    points.append(cleaned_point)
             details.append(
                 {
                     "title": cleaned_title,
-                    "explanation": sanitize_inline_html(explanation),
-                    "importance": sanitize_inline_html(importance),
+                    "explanation": remove_timestamps(sanitize_inline_html(explanation)),
+                    "importance": remove_timestamps(sanitize_inline_html(importance)),
+                    "points": points,
                 }
             )
         return details[:8] or build_local_topic_details(summary_text)
@@ -2556,11 +2634,11 @@ def build_article_image_url(topic: Optional[str]) -> str:
     return "https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=1200&q=80"
 
 
-def gemini_rag(context: str, query: str) -> dict[str, str]:
+def gemini_rag(context: str, query: str) -> dict[str, object]:
     prompt = f"""
-You are an expert video analyst and content strategist.
+You are an expert video analyst and editorial researcher.
 
-Study the source context carefully and extract only the article-worthy ideas that are actually present in it.
+Analyze the provided source deeply. Do not transcribe it. Identify the central idea, summarize it clearly, and break it into meaningful topics.
 
 Context from media:
 {context}
@@ -2569,37 +2647,85 @@ User Query:
 {query}
 
 Instructions:
-- Create a strong, specific title for the source.
-- Then write a concise and meaningful summary in 4 bullet points.
-- Keep the wording natural, professional, and grounded in the source.
+- Return only valid JSON.
+- Create one strong, specific heading for the source.
+- Write one concise but meaningful summary paragraph.
+- Create 3 to 7 key points from the actual source.
+- Create 4 to 7 dynamic topics based on the actual source.
+- Each topic must include 2 to 3 important sub-points with short explanations.
+- Keep the wording natural, professional, analytical, and grounded in the source.
 - Do not invent facts that are not supported by the source.
-- If the source compares countries, systems, history, politics, economics, or culture, preserve that framing accurately.
+- Do not include timestamps.
+- Do not sound like a transcript.
+- Do not repeat the same point.
+- Use the user's instruction to decide the angle of the analysis.
 
-Format strictly as:
-Headline: <headline>
-Summary:
-- point 1
-- point 2
-- point 3
-- point 4
+Return JSON in this shape:
+{{
+  "heading": "Main heading",
+  "summary": "Short meaningful summary",
+  "key_points": ["Point one", "Point two"],
+  "topics": [
+    {{
+      "title": "Topic title",
+      "explanation": "Short topic summary",
+      "importance": "Why this topic matters",
+      "points": [
+        {{"label": "Sub-point heading", "description": "Short explanation based on the source"}}
+      ]
+    }}
+  ]
+}}
 """
     response_text = gemini_generate_text(prompt)
+    payload = json.loads(response_text)
+    if not isinstance(payload, dict):
+        raise ValueError("Gemini analysis payload must be an object.")
 
-    headline_text = ""
-    summary_lines = []
-    current_section = None
-    for line in response_text.splitlines():
-        if line.startswith("Headline:"):
-            headline_text = line.replace("Headline:", "").strip()
-            current_section = "headline"
-        elif line.startswith("Summary:"):
-            current_section = "summary"
-        elif current_section == "summary" and line.strip():
-            summary_lines.append(sanitize_inline_html(line.strip()))
+    heading = remove_timestamps(sanitize_inline_html(str(payload.get("heading", "")).strip())) or "Media summary"
+    summary = remove_timestamps(sanitize_inline_html(str(payload.get("summary", "")).strip()))
+    raw_key_points = payload.get("key_points", [])
+    key_points = []
+    if isinstance(raw_key_points, list):
+        for item in raw_key_points:
+            cleaned = remove_timestamps(sanitize_inline_html(str(item).strip()))
+            if cleaned and cleaned not in key_points:
+                key_points.append(cleaned)
+
+    raw_topics = payload.get("topics", [])
+    topics: list[dict[str, object]] = []
+    if isinstance(raw_topics, list):
+        for item in raw_topics:
+            if not isinstance(item, dict):
+                continue
+            title = clean_topic_title(str(item.get("title", "")).strip())
+            explanation = remove_timestamps(sanitize_inline_html(str(item.get("explanation", "")).strip()))
+            importance = remove_timestamps(sanitize_inline_html(str(item.get("importance", "")).strip()))
+            points = []
+            for raw_point in item.get("points", []) if isinstance(item.get("points", []), list) else []:
+                cleaned_point = sanitize_topic_point(raw_point)
+                if cleaned_point:
+                    points.append(cleaned_point)
+            if not title:
+                continue
+            topics.append(
+                {
+                    "title": title,
+                    "explanation": explanation,
+                    "importance": importance,
+                    "points": points,
+                }
+            )
+
+    if not summary and key_points:
+        summary = " ".join(key_points[:2])
 
     return {
-        "headline": headline_text or "Media summary",
-        "summary": "\n".join(summary_lines).strip() or "No summary generated.",
+        "heading": heading,
+        "headline": heading,
+        "summary": summary or "No summary generated.",
+        "key_points": key_points,
+        "topics": topics,
     }
 
 
@@ -2640,12 +2766,20 @@ def enrich_analysis(
         cached_source = load_cached_source_content(source_cache_key)
         if isinstance(cached_source, dict) and isinstance(cached_source.get("content"), str):
             source_context = str(cached_source["content"])
-    headline = result.get("headline", "Media summary")
-    summary = result.get("summary", "")
-    key_points = summary_to_key_points(summary)
-    topic_details, used_fallback_topics = build_topic_details_bundle(summary)
+    headline = str(result.get("heading") or result.get("headline") or "Media summary")
+    summary = remove_timestamps(str(result.get("summary", "") or ""))
+    raw_key_points = result.get("key_points", [])
+    if isinstance(raw_key_points, list):
+        key_points = [remove_timestamps(sanitize_inline_html(str(item))) for item in raw_key_points if str(item).strip()]
+    else:
+        key_points = []
+    if not key_points:
+        key_points = summary_to_key_points(summary)
+    structured_topics = result.get("topics", []) if isinstance(result.get("topics", []), list) else None
+    topic_details, used_fallback_topics = build_topic_details_bundle(summary, structured_topics=structured_topics)
     topics = [item["title"] for item in topic_details]
     payload: dict[str, object] = {
+        "heading": headline,
         "headline": headline,
         "summary": summary,
         "key_points": key_points,

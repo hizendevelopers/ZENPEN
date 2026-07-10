@@ -770,12 +770,12 @@ function buildAnalysisSummary() {
   return `
     <div class="analysis-result-card">
       <span class="eyebrow">Analysis Output</span>
-      <h2>${escapeHtml(result.headline)}</h2>
+      <h2>${escapeHtml(result.heading || result.headline)}</h2>
       ${result.topic_generation_warning ? `<div class="state-banner empty-state inline-state">${escapeHtml(result.topic_generation_warning)}</div>` : ''}
       <div class="analysis-grid">
         <div class="summary-block">
           <h3>Summary</h3>
-          <p>${escapeHtml(summaryItems[0] || stripHtmlToText(result.summary || ''))}</p>
+          <p>${escapeHtml(stripHtmlToText(result.summary || ''))}</p>
         </div>
         <div class="summary-block">
           <h3>Key Points</h3>
@@ -809,7 +809,7 @@ function buildTopicSelector() {
     <section class="topic-section">
       <div class="section-heading compact-heading">
         <span class="eyebrow">Detected Topics</span>
-        <h3>Select one topic for article generation</h3>
+        <h3>Which topic do you want an article on?</h3>
       </div>
       <div class="topic-form">
         <div class="topic-selector-grid">
@@ -817,6 +817,16 @@ function buildTopicSelector() {
             <article class="topic-option ${selectedTopic === topic.title ? 'topic-option-active' : ''}">
               <span class="topic-pill">${escapeHtml(topic.title)}</span>
               ${topic.explanation ? `<p class="topic-option-copy">${topic.explanation}</p>` : ''}
+              ${Array.isArray(topic.points) && topic.points.length ? `
+                <div class="topic-points-list">
+                  ${topic.points.map((point) => `
+                    <div class="topic-point">
+                      <strong>${escapeHtml(point.label || 'Key idea')}:</strong>
+                      <p>${escapeHtml(point.description || '')}</p>
+                    </div>
+                  `).join('')}
+                </div>
+              ` : ''}
               ${topic.importance ? `<p class="topic-option-note">${topic.importance}</p>` : ''}
               <button class="primary-btn topic-generate-btn" type="button" data-action="generate-topic-article" data-topic-title="${escapeHtml(topic.title)}" ${appState.busyMode === 'articles' ? 'disabled' : ''}>Generate Article</button>
             </article>

@@ -18,9 +18,11 @@ from app import (
     fetch_youtube_transcript_text,
     find_http_urls_in_payload,
     build_local_topic_details,
+    gemini_rag,
     generate_article_html,
     get_topic_details_from_summary,
     map_public_error_message,
+    remove_timestamps,
     save_cached_source_content,
     sanitize_article_html,
     is_youtube_url,
@@ -112,6 +114,44 @@ def test_build_local_topic_details_creates_editorial_titles():
     assert details
     assert len(details[0]["title"].split()) >= 2
     assert "source material" not in details[0]["importance"].lower()
+    assert isinstance(details[0]["points"], list)
+    assert details[0]["points"]
+
+
+def test_remove_timestamps_strips_common_formats():
+    text = "[00:19] First line (03:59) and 12:42 are removed."
+    cleaned = remove_timestamps(text)
+    assert "[" not in cleaned
+    assert "03:59" not in cleaned
+    assert "12:42" not in cleaned
+
+
+def test_gemini_rag_returns_structured_analysis_without_timestamps(monkeypatch):
+    monkeypatch.setattr(
+        'app.gemini_generate_text',
+        lambda prompt: """
+        {
+          "heading": "Inside a Coordinated Growth Model",
+          "summary": "The video explains how policy, infrastructure, and long-term planning reinforce each other.",
+          "key_points": ["[00:19] Long-term planning matters", "Infrastructure scales national capacity"],
+          "topics": [
+            {
+              "title": "Long-Term Vision and Consistency",
+              "explanation": "The source links durable planning with stronger execution.",
+              "importance": "It shows why consistency shapes national outcomes.",
+              "points": [
+                {"label": "Decades-long planning", "description": "(03:59) The video highlights policy continuity over long horizons."},
+                {"label": "Execution discipline", "description": "Institutions are shown as carrying plans through delivery."}
+              ]
+            }
+          ]
+        }
+        """
+    )
+    result = gemini_rag("source context", "Give me breaking news and main points")
+    assert result["heading"] == "Inside a Coordinated Growth Model"
+    assert all(":" not in point[:6] for point in result["key_points"])
+    assert result["topics"][0]["points"][0]["description"].startswith("The video highlights")
 
 
 def test_fallback_article_avoids_banned_meta_phrases():

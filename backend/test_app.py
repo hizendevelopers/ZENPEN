@@ -35,6 +35,15 @@ from app import (
 client = TestClient(app)
 
 
+LONG_VIDEO_TRANSCRIPT = (
+    "China's development model is presented as a story of institutions, coordination, and long-term planning. "
+    "The speaker explains that rapid transformation is not the result of one individual but of a wider system that keeps executing over decades. "
+    "The video compares this consistency with countries where policies change too often and long-term projects stall. "
+    "It also connects universities, infrastructure, industry, and competition as parts of one larger national machine. "
+    "The argument keeps returning to execution, discipline, and macro-level thinking as the real drivers of growth."
+)
+
+
 def test_select_best_audio_format_prefers_audio_only():
     info = {
         'formats': [
@@ -152,6 +161,43 @@ def test_gemini_rag_returns_structured_analysis_without_timestamps(monkeypatch):
     assert result["heading"] == "Inside a Coordinated Growth Model"
     assert all(":" not in point[:6] for point in result["key_points"])
     assert result["topics"][0]["points"][0]["description"].startswith("The video highlights")
+
+
+def test_gemini_rag_retries_when_metadata_pollution_is_detected(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_generate_text(prompt):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return """
+            {
+              "heading": "Mooroo | https | Instagram",
+              "summary": "instagram.com/example https://youtube.com/watch?v=test",
+              "key_points": ["Instagram", "https"],
+              "topics": [{"title": "Https", "points": [{"label": "Link", "description": "instagram.com/example"}]}]
+            }
+            """
+        return """
+        {
+          "heading": "China's Growth Relies on Coordinated Systems",
+          "summary": "The video explains how institutions, infrastructure, and long-term planning work together.",
+          "key_points": ["Execution is framed as a system-wide strength.", "Long-term policy continuity supports industrial growth."],
+          "topics": [
+            {
+              "title": "The Power of a Coordinated System",
+              "points": [
+                {"label": "Execution discipline", "description": "The speaker ties visible progress to disciplined institutions."}
+              ]
+            }
+          ]
+        }
+        """
+
+    monkeypatch.setattr('app.gemini_generate_text', fake_generate_text)
+    result = gemini_rag(LONG_VIDEO_TRANSCRIPT, "Give breaking news and main points", source_url="https://youtu.be/example")
+    assert calls["count"] == 2
+    assert "https" not in result["heading"].lower()
+    assert result["topics"][0]["title"] == "The Power of a Coordinated System"
 
 
 def test_fallback_article_avoids_banned_meta_phrases():
@@ -293,12 +339,14 @@ def test_generate_article_html_skips_proofread_in_fast_mode(monkeypatch):
 def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
-    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript from YouTube captions.')
-    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
-        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
-    ])
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Instagram link https://instagram.com/test', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Systems, Planning, and National Coordination',
+        'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
+        'key_points': ['Institutions matter more than personalities.', 'Consistency supports industrial growth.'],
+        'topics': [{'title': 'Coordinated Systems', 'points': [{'label': 'Execution', 'description': 'The video links growth to disciplined execution.'}]}],
+    })
 
     response = client.post(
         '/api/analyze',
@@ -309,7 +357,7 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch, tmp_
     payload = response.json()
     assert payload['success'] is True
     assert 'headline' in payload['result']
-    assert payload['result']['topics'] == ['Topic A']
+    assert payload['result']['topics'] == ['Coordinated Systems']
 
 
 def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch, tmp_path):
@@ -317,12 +365,14 @@ def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     download_calls = {'count': 0}
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: download_calls.__setitem__('count', download_calls['count'] + 1) or 'fake-audio.wav')
-    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
-        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
-    ])
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Systems, Planning, and National Coordination',
+        'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
+        'key_points': ['Institutions matter more than personalities.'],
+        'topics': [{'title': 'Coordinated Systems', 'points': [{'label': 'Execution', 'description': 'The video links growth to disciplined execution.'}]}],
+    })
 
     response = client.post(
         '/api/analyze',
@@ -332,7 +382,7 @@ def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch
     assert response.status_code == 200
     payload = response.json()
     assert payload['success'] is True
-    assert payload['result']['topics'] == ['Topic A']
+    assert payload['result']['topics'] == ['Coordinated Systems']
     assert download_calls['count'] == 0
 
 
@@ -500,16 +550,20 @@ def test_analyze_endpoint_rejects_unsupported_upload_type():
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: 'Transcript available immediately.')
-    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
-        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'},
-        {'title': 'Topic B', 'explanation': 'Explanation B', 'importance': 'Importance B'},
-    ])
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Systems, Planning, and National Coordination',
+        'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
+        'key_points': ['Institutions matter more than personalities.'],
+        'topics': [
+            {'title': 'Coordinated Systems', 'points': [{'label': 'Execution', 'description': 'The video links growth to disciplined execution.'}]},
+            {'title': 'Long-Term Planning', 'points': [{'label': 'Policy continuity', 'description': 'The source contrasts stable planning with policy churn.'}]},
+        ],
+    })
 
     result = analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
 
-    assert result['topics'] == ['Topic A', 'Topic B']
+    assert result['topics'] == ['Coordinated Systems', 'Long-Term Planning']
     assert result['articles'] == []
 
 
@@ -517,15 +571,17 @@ def test_analyze_url_source_downloads_and_transcribes_youtube(monkeypatch, tmp_p
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
-    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: 'Subtitle transcript available immediately.')
-    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
-        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
-    ])
+    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Systems, Planning, and National Coordination',
+        'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
+        'key_points': ['Institutions matter more than personalities.'],
+        'topics': [{'title': 'Coordinated Systems', 'points': [{'label': 'Execution', 'description': 'The video links growth to disciplined execution.'}]}],
+    })
 
     result = analyze_url_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
 
-    assert result['topics'] == ['Topic A']
+    assert result['topics'] == ['Coordinated Systems']
     assert result['articles'] == []
 
 
@@ -554,14 +610,16 @@ def test_analyze_youtube_source_falls_back_when_direct_analysis_fails(monkeypatc
     monkeypatch.setattr('app.remote_media_fallback_available', lambda: True)
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'Recovered transcript from fallback path.')
-    monkeypatch.setattr('app.get_embeddings', lambda chunks: (_ for _ in ()).throw(RuntimeError('skip embeddings')))
-    monkeypatch.setattr('app.get_topic_details_from_summary', lambda summary: [
-        {'title': 'Topic A', 'explanation': 'Explanation A', 'importance': 'Importance A'}
-    ])
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Recovered analysis',
+        'summary': 'Fallback transcription recovered the source content.',
+        'key_points': ['Fallback path succeeded.'],
+        'topics': [{'title': 'Recovered Topic', 'points': [{'label': 'Recovered point', 'description': 'Recovered transcript from fallback path.'}]}],
+    })
 
     result = analyze_youtube_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
 
-    assert result['topics'] == ['Topic A']
+    assert result['topics'] == ['Recovered Topic']
     assert result['direct_analysis'] is False
 
 

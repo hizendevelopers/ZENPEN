@@ -215,6 +215,9 @@ GENERIC_TOPIC_TITLES = {
     "strong", "explicit", "article", "content", "message", "video", "story", "analysis",
     "commitment",
 }
+SUSPICIOUS_ANALYSIS_TITLES = {
+    "https", "http", "instagram", "youtube", "mooroo", "channel", "credits", "link", "links",
+}
 SUPPORTED_UPLOAD_MIME_PREFIXES = ("video/", "audio/")
 SUPPORTED_MEDIA_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mov", ".mkv", ".avi", ".webm"}
 UNSUPPORTED_DIRECT_SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
@@ -1100,19 +1103,32 @@ def fetch_youtube_metadata(url: str) -> dict[str, object]:
     }
 
 
+def sanitize_youtube_metadata_text(text: str) -> str:
+    cleaned = unescape(text or "")
+    cleaned = re.sub(r"https?://\S+", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"www\.\S+", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"@\w+", " ", cleaned)
+    cleaned = re.sub(r"#\w+", " ", cleaned)
+    cleaned = re.sub(r"\b(?:instagram|youtube|facebook|twitter|tiktok)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:follow|subscribe|credits?|link in bio)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
 def build_youtube_source_text(metadata: dict[str, object], transcript_text: str = "") -> str:
-    title = str(metadata.get("title") or "")
-    description = str(metadata.get("description") or "")
-    channel = str(metadata.get("channel") or "")
-    categories = ", ".join(metadata.get("categories") or [])
-    tags = ", ".join(metadata.get("tags") or [])
+    title = sanitize_youtube_metadata_text(str(metadata.get("title") or ""))
+    transcript_text = clean_source_text(transcript_text or "")
+    if transcript_text:
+        pieces = [
+            f"Video title: {title}" if title else "",
+            transcript_text,
+        ]
+        return clean_source_text("\n".join(piece for piece in pieces if piece).strip())
+
+    description = sanitize_youtube_metadata_text(str(metadata.get("description") or ""))
     pieces = [
-        f"Video title: {title}",
-        f"Channel: {channel}" if channel else "",
-        f"Categories: {categories}" if categories else "",
-        f"Tags: {tags}" if tags else "",
-        f"Description: {description}" if description else "",
-        transcript_text or "",
+        f"Video title: {title}" if title else "",
+        f"Short description: {description[:280]}" if description else "",
     ]
     return clean_source_text("\n".join(piece for piece in pieces if piece).strip())
 
@@ -1208,6 +1224,61 @@ def remove_timestamps(text: str) -> str:
     cleaned = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
+
+
+def contains_metadata_pollution(text: str) -> bool:
+    candidate = (text or "").lower()
+    if not candidate:
+        return False
+    patterns = [
+        r"https?://",
+        r"www\.",
+        r"instagram\.com",
+        r"youtube\.com",
+        r"\binstagram\b",
+        r"\bcredits?\b",
+        r"\bfollow\b",
+        r"\bsubscribe\b",
+        r"\blink in bio\b",
+    ]
+    return any(re.search(pattern, candidate) for pattern in patterns)
+
+
+def analysis_output_is_valid(result: dict[str, object]) -> bool:
+    heading = str(result.get("heading") or result.get("headline") or "")
+    summary = str(result.get("summary") or "")
+    key_points = result.get("key_points", [])
+    topics = result.get("topics", [])
+
+    text_fragments = [heading, summary]
+    if isinstance(key_points, list):
+        text_fragments.extend(str(item) for item in key_points)
+    if isinstance(topics, list):
+        for topic in topics:
+            if not isinstance(topic, dict):
+                return False
+            title = clean_topic_title(str(topic.get("title", "")))
+            if not title or title.lower() in SUSPICIOUS_ANALYSIS_TITLES:
+                return False
+            text_fragments.append(title)
+            text_fragments.append(str(topic.get("explanation", "")))
+            text_fragments.append(str(topic.get("importance", "")))
+            points = topic.get("points", [])
+            if not isinstance(points, list) or not points:
+                return False
+            for point in points:
+                if not isinstance(point, dict):
+                    return False
+                text_fragments.append(str(point.get("label", "")))
+                text_fragments.append(str(point.get("description", "")))
+
+    normalized_fragments = [remove_timestamps(strip_html_tags(fragment)).strip() for fragment in text_fragments if str(fragment).strip()]
+    if any(contains_metadata_pollution(fragment) for fragment in normalized_fragments):
+        return False
+    unique_fragments = {re.sub(r"\W+", " ", fragment.lower()).strip() for fragment in normalized_fragments if fragment}
+    if len(unique_fragments) < max(4, len(normalized_fragments) // 3):
+        return False
+    return bool(heading.strip() and summary.strip() and isinstance(topics, list) and topics)
 
 
 def clean_source_text(text: str) -> str:
@@ -2634,14 +2705,21 @@ def build_article_image_url(topic: Optional[str]) -> str:
     return "https://images.unsplash.com/photo-1504711434969-e33886168f5c?auto=format&fit=crop&w=1200&q=80"
 
 
-def gemini_rag(context: str, query: str) -> dict[str, object]:
+def gemini_rag(context: str, query: str, *, source_url: str = "", retry_strict: bool = False) -> dict[str, object]:
+    retry_warning = (
+        "The previous response summarized metadata instead of the video content. Re-analyze the actual video content only. Ignore URLs, credits, descriptions, and metadata.\n"
+        if retry_strict else ""
+    )
+    source_reference = f"\nSource URL:\n{source_url}\n" if source_url else ""
     prompt = f"""
 You are an expert video analyst and editorial researcher.
 
-Analyze the provided source deeply. Do not transcribe it. Identify the central idea, summarize it clearly, and break it into meaningful topics.
+{retry_warning}
+Analyze the actual content of the provided source deeply. Do not transcribe it. Identify the central idea, summarize it clearly, and break it into meaningful topics.
 
 Context from media:
 {context}
+{source_reference}
 
 User Query:
 {query}
@@ -2656,6 +2734,8 @@ Instructions:
 - Keep the wording natural, professional, analytical, and grounded in the source.
 - Do not invent facts that are not supported by the source.
 - Do not include timestamps.
+- Do not summarize the YouTube description, links, credits, tags, channel metadata, Instagram URLs, promotional text, or repeated keywords.
+- Ignore all URLs and boilerplate metadata unless the actual spoken content is directly about them.
 - Do not sound like a transcript.
 - Do not repeat the same point.
 - Use the user's instruction to decide the angle of the analysis.
@@ -2720,13 +2800,18 @@ Return JSON in this shape:
     if not summary and key_points:
         summary = " ".join(key_points[:2])
 
-    return {
+    result = {
         "heading": heading,
         "headline": heading,
         "summary": summary or "No summary generated.",
         "key_points": key_points,
         "topics": topics,
     }
+    if not analysis_output_is_valid(result):
+        if retry_strict:
+            raise ValueError("Gemini analysis output was polluted by metadata.")
+        return gemini_rag(context, query, source_url=source_url, retry_strict=True)
+    return result
 
 
 def generate_news_article(headline_text: str, summary_text: str, topic: Optional[str] = None) -> str:
@@ -2943,7 +3028,7 @@ def analyze_media(
                 context = " ".join(chunks[:3])
             try:
                 with profiler.stage("analysis_generation"):
-                    result = gemini_rag(context, query)
+                    result = gemini_rag(context, query, source_url="")
                 profiler.log_total()
                 return result, transcript
             except Exception:
@@ -2980,7 +3065,7 @@ def analyze_media(
 
     try:
         with profiler.stage("analysis_generation"):
-            result = gemini_rag(context, query)
+            result = gemini_rag(context, query, source_url="")
         profiler.log_total()
         return result, transcript
     except Exception:
@@ -3009,7 +3094,7 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content", 
 
     try:
         with profiler.stage("analysis_generation"):
-            result = gemini_rag(context, query)
+            result = gemini_rag(context, query, source_url="")
         profiler.log_total()
         return result, transcript
     except Exception:
@@ -3073,16 +3158,22 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
                     direct_failure = subtitle_exc
         with profiler.stage("transcript_cleaning"):
             source_context = build_youtube_source_text(metadata, transcript_text)
+        if len(clean_source_text(transcript_text)) < 180:
+            raise RuntimeError("Gemini could not analyze the actual video content from quick transcript sources.")
         if not source_context.strip():
             raise RuntimeError("Gemini could not analyze the video from the available source data.")
         if progress_callback:
             progress_callback("extracting_topics", "Extracting headline, summary, and main topics...", 68)
         with profiler.stage("analysis_generation"):
-            result, cleaned_transcript = analyze_text_content(
-                source_context,
-                query=query or "Summarize the content",
-                progress_callback=progress_callback,
-            )
+            analysis_input = build_chunk_safe_analysis_input(source_context, query or "Summarize the content", progress_callback=progress_callback)
+            chunks = chunk_text(analysis_input)
+            try:
+                with profiler.stage("topic_analysis_context"):
+                    context = build_analysis_context(analysis_input, chunks, query or "Summarize the content")
+            except Exception:
+                context = " ".join(chunks[:3])
+            result = gemini_rag(context, query or "Summarize the content", source_url=url)
+            cleaned_transcript = source_context
         source_context = cleaned_transcript or source_context
     except Exception as direct_exc:
         direct_failure = direct_exc

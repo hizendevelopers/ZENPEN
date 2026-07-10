@@ -253,7 +253,9 @@ function mapUserFacingError(error) {
   if (lower.includes('video could not be downloaded')) return 'Video could not be downloaded. The source may be private or unavailable.';
   if (lower.includes('source is private or unavailable')) return 'Source is private or unavailable.';
   if (lower.includes('gemini could not analyze the video directly')) return 'Direct video analysis failed. Trying audio transcription fallback may be required.';
+  if (lower.includes('direct video analysis took too long')) return 'Direct video analysis took too long. Trying captions/transcript fallback may help.';
   if (lower.includes('transcription failed')) return 'Transcription failed. Please try another source or upload the audio/video file directly.';
+  if (lower.includes('captions were not available')) return 'Captions were not available. Trying audio transcription...';
   if (lower.includes('website blocked automated access')) return 'The website blocked automated access. Please try another public URL.';
   if (lower.includes('could not provide transcript or subtitle text quickly enough')) return 'Direct video analysis failed. Trying audio transcription fallback...';
   if (lower.includes('youtube video cannot be accessed')) return 'This YouTube video cannot be processed right now. Please try another source or upload the file.';
@@ -1125,9 +1127,17 @@ function startAnalysisPolling(jobId) {
   stopAnalysisPolling();
   appState.activeJobId = jobId;
   const genericProcessingMessage = 'We are processing your source in the background.';
+  const pollStartedAt = Date.now();
+  const maxPollMs = 8 * 60 * 1000;
 
   const poll = async () => {
     try {
+      if (Date.now() - pollStartedAt >= maxPollMs) {
+        appState.analysisError = 'Analysis took too long and was stopped. Please retry or use a shorter source.';
+        clearBusyStates();
+        renderApp();
+        return;
+      }
       const payload = await fetchAnalysisJob(jobId);
       if (payload.progress?.message && payload.progress.message !== genericProcessingMessage) {
         appState.busyMessage = payload.progress.message;
@@ -1141,7 +1151,7 @@ function startAnalysisPolling(jobId) {
         return;
       }
       if (payload.status === 'failed' || payload.success === false) {
-        appState.analysisError = mapUserFacingError(payload.error || 'The background analysis failed.');
+        appState.analysisError = mapUserFacingError(payload.message || payload.error || 'The background analysis failed.');
         clearBusyStates();
         renderApp();
         return;

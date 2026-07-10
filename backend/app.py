@@ -85,10 +85,12 @@ LONG_TRANSCRIPT_THRESHOLD = int(os.getenv("LONG_TRANSCRIPT_THRESHOLD", "7000"))
 SUMMARY_CONCURRENCY = max(1, int(os.getenv("SUMMARY_CONCURRENCY", "3")))
 ENABLE_DEEP_ARTICLE_REFINEMENT = os.getenv("ENABLE_DEEP_ARTICLE_REFINEMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 SOURCE_CACHE_TTL_SECONDS = int(os.getenv("SOURCE_CACHE_TTL_SECONDS", str(60 * 60 * 12)))
-YOUTUBE_DIRECT_ANALYSIS_TIMEOUT = int(os.getenv("YOUTUBE_DIRECT_ANALYSIS_TIMEOUT", "90"))
-YOUTUBE_TRANSCRIPT_TIMEOUT = int(os.getenv("YOUTUBE_TRANSCRIPT_TIMEOUT", "45"))
-YOUTUBE_SUBTITLE_TIMEOUT = int(os.getenv("YOUTUBE_SUBTITLE_TIMEOUT", "60"))
+YOUTUBE_DIRECT_ANALYSIS_TIMEOUT = int(os.getenv("YOUTUBE_DIRECT_ANALYSIS_TIMEOUT", "120"))
+YOUTUBE_TRANSCRIPT_TIMEOUT = int(os.getenv("YOUTUBE_TRANSCRIPT_TIMEOUT", "30"))
+YOUTUBE_SUBTITLE_TIMEOUT = int(os.getenv("YOUTUBE_SUBTITLE_TIMEOUT", "30"))
 YOUTUBE_FALLBACK_TIMEOUT = int(os.getenv("YOUTUBE_FALLBACK_TIMEOUT", "180"))
+ANALYSIS_JOB_MAX_SECONDS = int(os.getenv("ANALYSIS_JOB_MAX_SECONDS", "480"))
+ANALYSIS_JOB_STALE_SECONDS = int(os.getenv("ANALYSIS_JOB_STALE_SECONDS", "150"))
 GEMINI_BACKOFF_UNTIL = 0.0
 
 logger = logging.getLogger("zenpen.performance")
@@ -993,15 +995,20 @@ def save_cached_article_result(cache_key: str, payload: dict[str, object]) -> No
 
 
 def run_with_timeout(label: str, timeout_seconds: int, func, *args, **kwargs):
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(func, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout_seconds)
-        except Exception as exc:
-            from concurrent.futures import TimeoutError as FutureTimeoutError
-            if isinstance(exc, FutureTimeoutError):
-                raise RuntimeError(f"{label} timed out.") from exc
-            raise
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except Exception as exc:
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+        if isinstance(exc, FutureTimeoutError):
+            logger.warning("%s | timeout after %ss", label, timeout_seconds)
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise RuntimeError(f"{label} timed out.") from exc
+        raise
+    finally:
+        executor.shutdown(wait=False, cancel_futures=False)
 
 
 def build_transcript_api_instance():
@@ -3230,30 +3237,49 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
     with profiler.stage("source_fetch_download"):
         metadata = run_with_timeout("YouTube metadata analysis", 35, fetch_youtube_metadata, url)
 
-    try:
-        with profiler.stage("analysis_generation"):
-            result = run_with_timeout(
-                "YouTube direct Gemini analysis",
-                YOUTUBE_DIRECT_ANALYSIS_TIMEOUT,
-                direct_gemini_youtube_analysis,
+        try:
+            with profiler.stage("analysis_generation"):
+                logger.info("analysis-job | direct_gemini_start | url=%s", url)
+                result = run_with_timeout(
+                    "YouTube direct Gemini analysis",
+                    YOUTUBE_DIRECT_ANALYSIS_TIMEOUT,
+                    direct_gemini_youtube_analysis,
+                    url,
+                    query or "Summarize the content",
+                    metadata,
+                )
+            source_context = build_youtube_source_text(metadata, "")
+            if progress_callback:
+                progress_callback("finalizing_output", "Finalizing headline, summary, and topic list...", 94)
+            source_cache_key = build_content_cache_key("source-context", f"youtube|{url}|{source_context or result.get('summary', '')}")
+            save_cached_source_content(
+                source_cache_key,
+                {"content": source_context or str(result.get("summary") or ""), "source_type": "youtube"},
+            )
+            payload = enrich_analysis(
+                result,
+                generate_article=False,
+                source_context=source_context or str(result.get("summary") or ""),
+                source_type="youtube",
+                source_cache_key=source_cache_key,
+            )
+            payload["direct_analysis"] = True
+            save_cached_analysis_result(analysis_cache_key, payload)
+            profiler.log_total()
+            return payload
+        except Exception as direct_exc:
+            direct_failure = direct_exc
+            logger.warning(
+                "youtube-direct-analysis-reason | url=%s | reason=%s",
                 url,
-                query or "Summarize the content",
-                metadata,
+                direct_gemini_failure_reason(direct_exc),
             )
-        source_context = build_youtube_source_text(metadata, "")
-    except Exception as direct_exc:
-        direct_failure = direct_exc
-        logger.warning(
-            "youtube-direct-analysis-reason | url=%s | reason=%s",
-            url,
-            direct_gemini_failure_reason(direct_exc),
-        )
-        if progress_callback:
-            progress_callback(
-                "transcription",
-                "Direct video analysis failed. Trying captions/transcript fallback...",
-                28,
-            )
+            if progress_callback:
+                progress_callback(
+                    "transcription",
+                    "Direct video analysis failed. Trying captions/transcript fallback...",
+                    28,
+                )
 
         with tempfile.TemporaryDirectory(prefix="yt-direct-analysis-") as temp_dir:
             captions_error: Optional[Exception] = None
@@ -3295,6 +3321,8 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
                 result = gemini_rag(context, query or "Summarize the content", source_url=url)
             source_context = source_context
         else:
+            if progress_callback:
+                progress_callback("fallback_transcription", "Captions were not available. Trying audio transcription...", 38)
             if not remote_media_fallback_available():
                 raise RuntimeError("Gemini direct analysis failed and no captions/transcript were available.") from captions_error or direct_exc
             result, cleaned_transcript = analyze_youtube_via_transcription_fallback(url, query or "Summarize the content", progress_callback=progress_callback)
@@ -3408,6 +3436,36 @@ def serialize_job_status(job: Job) -> dict[str, object]:
         "progress": int(job.meta.get("progress") or 0),
     }
     status = job.get_status(refresh=True)
+    now = time.time()
+    raw_created_at_ts = job.meta.get("created_at_ts")
+    raw_updated_at_ts = job.meta.get("updated_at_ts")
+    created_at_ts = float(raw_created_at_ts) if raw_created_at_ts is not None else now
+    updated_at_ts = float(raw_updated_at_ts) if raw_updated_at_ts is not None else created_at_ts
+    age_seconds = max(0, int(now - created_at_ts))
+    stale_seconds = max(0, int(now - updated_at_ts))
+
+    if status not in {"finished", "failed"}:
+        if age_seconds >= ANALYSIS_JOB_MAX_SECONDS or stale_seconds >= ANALYSIS_JOB_STALE_SECONDS:
+            logger.warning(
+                "analysis-job-timeout | job_id=%s | status=%s | age=%ss | stale=%ss | stage=%s",
+                job.id,
+                status,
+                age_seconds,
+                stale_seconds,
+                progress_payload["stage"],
+            )
+            return {
+                "success": False,
+                "status": "failed",
+                "reason": "timeout",
+                "message": "Direct video analysis took too long. Please retry or use transcript fallback.",
+                "error": "Direct video analysis took too long. Please retry or use transcript fallback.",
+                "progress": {
+                    **progress_payload,
+                    "stage": "failed",
+                    "message": "Direct video analysis took too long. Please retry or use transcript fallback.",
+                },
+            }
     if status == "finished":
         return {
             "success": True,
@@ -3423,6 +3481,7 @@ def serialize_job_status(job: Job) -> dict[str, object]:
         return {
             "success": False,
             "status": "failed",
+            "reason": "error",
             "error": last_line or "Background job failed.",
             "progress": progress_payload,
         }
@@ -3633,8 +3692,7 @@ def job_status(job_id: str) -> JSONResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Analysis job not found.")
     payload = serialize_job_status(job)
-    status_code = 200 if payload.get("success", True) else 500
-    return JSONResponse(payload, status_code=status_code)
+    return JSONResponse(payload, status_code=200)
 
 
 @app.post("/api/analyze-youtube")

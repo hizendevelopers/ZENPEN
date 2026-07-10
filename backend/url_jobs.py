@@ -13,9 +13,11 @@ def update_job_progress(stage: str, message: str, progress: int) -> None:
     job = get_current_job()
     if job is None:
         return
+    job.meta.setdefault("created_at_ts", time.time())
     job.meta["stage"] = stage
     job.meta["message"] = message
     job.meta["progress"] = max(0, min(progress, 100))
+    job.meta["updated_at_ts"] = time.time()
     job.save_meta()
 
 
@@ -82,11 +84,15 @@ def enqueue_url_analysis(
         retry=Retry(max=3, interval=[10, 30, 60]),
         result_ttl=86400,
         failure_ttl=604800,
-        job_timeout=240,
+        job_timeout=480,
         description=f"Analyze URL: {url}",
     )
+    now = time.time()
     job.meta["stage"] = "analyzing_video" if is_youtube else "downloading_source"
     job.meta["message"] = "Analyzing video with Gemini..." if is_youtube else "Preparing source..."
     job.meta["progress"] = 5
+    job.meta["created_at_ts"] = now
+    job.meta["updated_at_ts"] = now
     job.save_meta()
     return job
+import time

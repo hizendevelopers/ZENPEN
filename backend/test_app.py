@@ -25,6 +25,7 @@ from app import (
     remove_timestamps,
     save_cached_source_content,
     sanitize_article_html,
+    serialize_job_status,
     is_youtube_url,
     select_any_non_youtube_url,
     select_apify_download_url,
@@ -648,6 +649,26 @@ def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_
     assert result['heading'] == 'Direct analysis heading'
     assert result['topics'] == ['Direct Topic']
     assert result['direct_analysis'] is True
+
+
+def test_serialize_job_status_marks_stale_jobs_as_timeout(monkeypatch):
+    class FakeJob:
+        id = 'job-1'
+        meta = {
+            'stage': 'analyzing_video',
+            'message': 'Analyzing video with Gemini...',
+            'progress': 12,
+            'created_at_ts': 0,
+            'updated_at_ts': 0,
+        }
+
+        def get_status(self, refresh=True):
+            return 'started'
+
+    monkeypatch.setattr('app.time.time', lambda: 999999)
+    payload = serialize_job_status(FakeJob())
+    assert payload['status'] == 'failed'
+    assert payload['reason'] == 'timeout'
 
 
 def test_analyze_youtube_endpoint_uses_cache(monkeypatch):

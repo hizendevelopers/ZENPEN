@@ -287,8 +287,8 @@ function startBusyStatusTimer(mode) {
   stopBusyStatusTimer();
   const stagesByMode = {
     analyzing: [
-      { delay: 8000, message: 'Extracting headline, summary, and topics...' },
-      { delay: 22000, message: 'This is taking longer than usual. We are still processing the source.' },
+      { delay: 8000, message: 'Extracting video transcript...' },
+      { delay: 22000, message: 'We are still extracting source content...' },
     ],
     articles: [
       { delay: 8000, message: 'Polishing article...' },
@@ -1127,17 +1127,9 @@ function startAnalysisPolling(jobId) {
   stopAnalysisPolling();
   appState.activeJobId = jobId;
   const genericProcessingMessage = 'We are processing your source in the background.';
-  const pollStartedAt = Date.now();
-  const maxPollMs = 8 * 60 * 1000;
 
   const poll = async () => {
     try {
-      if (Date.now() - pollStartedAt >= maxPollMs) {
-        appState.analysisError = 'Analysis took too long and was stopped. Please retry or use a shorter source.';
-        clearBusyStates();
-        renderApp();
-        return;
-      }
       const payload = await fetchAnalysisJob(jobId);
       if (payload.progress?.message && payload.progress.message !== genericProcessingMessage) {
         appState.busyMessage = payload.progress.message;
@@ -1278,7 +1270,7 @@ async function handleAnalyzeSubmit(form) {
   appState.busyMessage = sourceMode === 'upload'
     ? 'Uploading your media and preparing transcription...'
     : youtubeMode
-      ? 'Analyzing video with Gemini...'
+      ? 'Extracting video transcript...'
       : 'Preparing source and extracting content...';
   startBusyStatusTimer('analyzing');
   renderApp();
@@ -1294,7 +1286,7 @@ async function handleAnalyzeSubmit(form) {
       });
       if (payload.queued && payload.jobId) {
         appState.busyMode = 'analyzing';
-        appState.busyMessage = payload.progress?.message || 'Analyzing video with Gemini...';
+        appState.busyMessage = payload.progress?.message || 'Extracting video transcript...';
         appState.activeJobStage = payload.progress?.stage || '';
         startAnalysisPolling(payload.jobId);
         renderApp();

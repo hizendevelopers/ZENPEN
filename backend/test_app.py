@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app import (
     ANALYSIS_JOB_MAX_SECONDS,
     ENABLE_REMOTE_MEDIA_DOWNLOAD_FALLBACK,
+    build_youtube_source_text,
     YOUTUBE_DIRECT_ANALYSIS_TIMEOUT,
     analyze_text_content,
     app,
@@ -635,8 +636,39 @@ def test_analyze_youtube_source_falls_back_when_direct_analysis_fails(monkeypatc
     assert result['direct_analysis'] is False
 
 
+def test_build_youtube_source_text_does_not_use_description_as_transcript():
+    text = build_youtube_source_text(
+        {'title': 'Real Title', 'description': 'Follow us on Instagram https://instagram.com/test #news'},
+        '',
+    )
+    assert 'instagram' not in text.lower()
+    assert 'https' not in text.lower()
+    assert 'follow us' not in text.lower()
+
+
+def test_analyze_youtube_source_prefers_transcript_first_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
+    monkeypatch.setattr('app.ENABLE_DIRECT_GEMINI_YOUTUBE_ANALYSIS', False)
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel'})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(AssertionError('direct analysis should be skipped by default')))
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
+        'heading': 'Transcript heading',
+        'summary': 'Transcript summary.',
+        'key_points': ['Point one'],
+        'topics': [{'title': 'Transcript Topic', 'points': [{'label': 'Point', 'description': 'Transcript first worked.'}]}],
+    })
+
+    result = analyze_youtube_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
+
+    assert result['heading'] == 'Transcript heading'
+    assert result['topics'] == ['Transcript Topic']
+    assert result['direct_analysis'] is False
+
+
 def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_fetch(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
+    monkeypatch.setattr('app.ENABLE_DIRECT_GEMINI_YOUTUBE_ANALYSIS', True)
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel'})
     monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: {
         'heading': 'Direct analysis heading',
@@ -653,7 +685,7 @@ def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_
     assert result['direct_analysis'] is True
 
 
-def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_captions_fallback(monkeypatch):
+def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_transcript_extraction(monkeypatch):
     class FakeJob:
         id = 'job-1'
         meta = {
@@ -670,7 +702,7 @@ def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_captions_fall
     monkeypatch.setattr('app.time.time', lambda: 900000 + YOUTUBE_DIRECT_ANALYSIS_TIMEOUT + 5)
     payload = serialize_job_status(FakeJob())
     assert payload['status'] == 'started'
-    assert payload['progress']['stage'] == 'captions_fallback'
+    assert payload['progress']['stage'] == 'transcript_extraction'
     assert 'Extracting transcript' in payload['progress']['message']
 
 
@@ -767,7 +799,7 @@ def test_analyze_endpoint_queues_url_job_when_background_workers_are_available(m
     assert payload['success'] is True
     assert payload['queued'] is True
     assert payload['jobId'] == 'job-123'
-    assert payload['progress']['stage'] == 'direct_gemini'
+    assert payload['progress']['stage'] == 'transcript_extraction'
 
 
 def test_job_status_endpoint_returns_completed_result(monkeypatch):

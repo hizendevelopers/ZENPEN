@@ -116,6 +116,7 @@ class ArticlesRequest(BaseModel):
     summary: str
     topics: list[str] = []
     selected_topics: list[str]
+    selected_topic_details: dict[str, object] | None = None
     article_count: int = 1
     article_type: str = "Blog Article"
     target_audience: str = "General readers"
@@ -1439,7 +1440,9 @@ def build_topic_details_bundle(summary_text: str, structured_topics: Optional[li
         importance = remove_timestamps(sanitize_inline_html(str(item.get("importance", ""))))
         details.append(
             {
+                "id": f"topic_{len(details) + 1}",
                 "title": title,
+                "summary": explanation,
                 "explanation": explanation,
                 "importance": importance,
                 "points": points,
@@ -1640,6 +1643,8 @@ def build_article_package(
     headline_text: str,
     summary_text: str,
     topic: str,
+    topic_summary: str = "",
+    topic_points: list[dict[str, str]] | None = None,
     article_type: str,
     source_context: str,
     target_audience: str,
@@ -1651,6 +1656,8 @@ def build_article_package(
             headline_text=headline_text,
             summary_text=summary_text,
             topic=topic,
+            topic_summary=topic_summary,
+            topic_points=topic_points or [],
             article_type=article_type,
             source_context=source_context,
             target_audience=target_audience,
@@ -2415,7 +2422,9 @@ def build_local_topic_details(summary_text: str) -> list[dict[str, object]]:
             }
         )
     return details or [{
+        "id": "topic_1",
         "title": "The Main Argument Behind the Story",
+        "summary": sanitize_inline_html("The source centers on one clearly expandable issue with enough direction, detail, and tension to support a professional article."),
         "explanation": sanitize_inline_html("The source centers on one clearly expandable issue with enough direction, detail, and tension to support a professional article."),
         "importance": sanitize_inline_html("It matters because it captures the strongest idea in the material and gives the writer a solid editorial angle to build on."),
         "points": [
@@ -2506,7 +2515,9 @@ Summary:
                     points.append(cleaned_point)
             details.append(
                 {
+                    "id": f"topic_{len(details) + 1}",
                     "title": cleaned_title,
+                    "summary": remove_timestamps(sanitize_inline_html(explanation)),
                     "explanation": remove_timestamps(sanitize_inline_html(explanation)),
                     "importance": remove_timestamps(sanitize_inline_html(importance)),
                     "points": points,
@@ -2626,6 +2637,8 @@ def generate_article_html(
     headline_text: str,
     summary_text: str,
     topic: Optional[str],
+    topic_summary: str = "",
+    topic_points: list[dict[str, str]] | None = None,
     article_type: str,
     source_context: str,
     target_audience: str,
@@ -2635,7 +2648,13 @@ def generate_article_html(
     article_type = article_type if article_type in ARTICLE_TYPE_INSTRUCTIONS else "Blog Article"
     topic_text = topic or "Main Topic"
     source_excerpt = clean_source_text(source_context or summary_text)[:2800]
-    keywords = extract_top_keywords(f"{summary_text} {topic_text} {source_excerpt}", limit=8)
+    normalized_topic_points = topic_points or []
+    topic_points_text = "\n".join(
+        f"- {point.get('label', '').strip()}: {point.get('description', '').strip()}"
+        for point in normalized_topic_points
+        if isinstance(point, dict) and (point.get("label") or point.get("description"))
+    )
+    keywords = extract_top_keywords(f"{summary_text} {topic_text} {topic_summary} {topic_points_text} {source_excerpt}", limit=8)
     uniqueness_instruction = (
         "Use a fresh structure and angle for this version."
         if variant_index == 0
@@ -2649,6 +2668,12 @@ Selected article type:
 
 Topic:
 {topic_text}
+
+Selected topic summary:
+{topic_summary or "Use the source context to infer the strongest angle for this topic."}
+
+Selected topic sub-points:
+{topic_points_text or "- Use the strongest source-backed details relevant to the selected topic."}
 
 Target audience:
 {target_audience}
@@ -2763,8 +2788,9 @@ Return JSON in this shape:
   "key_points": ["Point one", "Point two"],
   "topics": [
     {{
+      "id": "topic_1",
       "title": "Topic title",
-      "explanation": "Short topic summary",
+      "summary": "Short topic summary",
       "importance": "Why this topic matters",
       "points": [
         {{"label": "Sub-point heading", "description": "Short explanation based on the source"}}
@@ -2795,7 +2821,7 @@ Return JSON in this shape:
             if not isinstance(item, dict):
                 continue
             title = clean_topic_title(str(item.get("title", "")).strip())
-            explanation = remove_timestamps(sanitize_inline_html(str(item.get("explanation", "")).strip()))
+            explanation = remove_timestamps(sanitize_inline_html(str(item.get("summary", "") or item.get("explanation", "")).strip()))
             importance = remove_timestamps(sanitize_inline_html(str(item.get("importance", "")).strip()))
             points = []
             for raw_point in item.get("points", []) if isinstance(item.get("points", []), list) else []:
@@ -2806,7 +2832,9 @@ Return JSON in this shape:
                 continue
             topics.append(
                 {
+                    "id": str(item.get("id", "")).strip() or f"topic_{len(topics) + 1}",
                     "title": title,
+                    "summary": explanation,
                     "explanation": explanation,
                     "importance": importance,
                     "points": points,
@@ -2934,6 +2962,11 @@ def enrich_analysis(
         return payload
 
     topics_to_use = (selected_topics[:1] if selected_topics else topics[:1]) or ["Main topic"]
+    topic_detail_lookup = {
+        str(item.get("title", "")).strip().lower(): item
+        for item in topic_details
+        if isinstance(item, dict) and str(item.get("title", "")).strip()
+    }
     work_items: list[tuple[int, str, int]] = []
     for topic_index, topic in enumerate(topics_to_use):
         for variant_index in range(max(article_count, 1)):
@@ -2941,10 +2974,13 @@ def enrich_analysis(
 
     def build_one(item: tuple[int, str, int]) -> tuple[int, dict[str, object]]:
         order, topic_name, variant_index = item
+        topic_detail = topic_detail_lookup.get(topic_name.strip().lower(), {})
         return order, build_article_package(
             headline_text=headline,
             summary_text=summary,
             topic=topic_name,
+            topic_summary=str(topic_detail.get("summary") or topic_detail.get("explanation") or ""),
+            topic_points=topic_detail.get("points") if isinstance(topic_detail.get("points"), list) else [],
             article_type=article_type,
             source_context=source_context or summary,
             target_audience=target_audience,
@@ -3413,6 +3449,25 @@ def build_articles_response(payload: ArticlesRequest) -> dict[str, object]:
         if isinstance(cached_source, dict) and isinstance(cached_source.get("content"), str):
             source_context = str(cached_source["content"])
 
+    selected_topic_summary = ""
+    selected_topic_points: list[dict[str, str]] = []
+    if isinstance(payload.selected_topic_details, dict):
+        selected_topic_summary = str(
+            payload.selected_topic_details.get("summary")
+            or payload.selected_topic_details.get("explanation")
+            or ""
+        ).strip()
+        raw_points = payload.selected_topic_details.get("points", [])
+        if isinstance(raw_points, list):
+            selected_topic_points = [
+                {
+                    "label": str(item.get("label", "")).strip(),
+                    "description": str(item.get("description", "")).strip(),
+                }
+                for item in raw_points
+                if isinstance(item, dict)
+            ]
+
     article_cache_key = build_content_cache_key(
         "article-result",
         json.dumps(
@@ -3425,6 +3480,8 @@ def build_articles_response(payload: ArticlesRequest) -> dict[str, object]:
                 "target_audience": payload.target_audience,
                 "source_cache_key": payload.source_cache_key,
                 "source_context": source_context[:2500],
+                "selected_topic_summary": selected_topic_summary,
+                "selected_topic_points": selected_topic_points,
             },
             sort_keys=True,
         ),
@@ -3447,7 +3504,7 @@ def build_articles_response(payload: ArticlesRequest) -> dict[str, object]:
             article_count=payload.article_count,
             article_type=payload.article_type,
             target_audience=payload.target_audience,
-            source_context=source_context,
+            source_context="\n".join(part for part in [source_context, selected_topic_summary, "\n".join(f"{point['label']}: {point['description']}" for point in selected_topic_points if point.get('label') or point.get('description'))] if part).strip(),
             source_cache_key=payload.source_cache_key,
         )
     if payload.topics:

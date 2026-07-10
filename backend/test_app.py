@@ -145,8 +145,9 @@ def test_gemini_rag_returns_structured_analysis_without_timestamps(monkeypatch):
           "key_points": ["[00:19] Long-term planning matters", "Infrastructure scales national capacity"],
           "topics": [
             {
+              "id": "topic_1",
               "title": "Long-Term Vision and Consistency",
-              "explanation": "The source links durable planning with stronger execution.",
+              "summary": "The source links durable planning with stronger execution.",
               "importance": "It shows why consistency shapes national outcomes.",
               "points": [
                 {"label": "Decades-long planning", "description": "(03:59) The video highlights policy continuity over long horizons."},
@@ -160,6 +161,7 @@ def test_gemini_rag_returns_structured_analysis_without_timestamps(monkeypatch):
     result = gemini_rag("source context", "Give me breaking news and main points")
     assert result["heading"] == "Inside a Coordinated Growth Model"
     assert all(":" not in point[:6] for point in result["key_points"])
+    assert result["topics"][0]["summary"] == "The source links durable planning with stronger execution."
     assert result["topics"][0]["points"][0]["description"].startswith("The video highlights")
 
 

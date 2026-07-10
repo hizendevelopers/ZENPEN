@@ -816,7 +816,7 @@ function buildTopicSelector() {
           ${topicDetails.map((topic) => `
             <article class="topic-option ${selectedTopic === topic.title ? 'topic-option-active' : ''}">
               <span class="topic-pill">${escapeHtml(topic.title)}</span>
-              ${topic.explanation ? `<p class="topic-option-copy">${topic.explanation}</p>` : ''}
+              ${topic.summary || topic.explanation ? `<p class="topic-option-copy">${topic.summary || topic.explanation}</p>` : ''}
               ${Array.isArray(topic.points) && topic.points.length ? `
                 <div class="topic-points-list">
                   ${topic.points.map((point) => `
@@ -1071,7 +1071,7 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source, end
   }
 }
 
-async function sendGenerateArticlesRequest({ headline, summary, topics, selectedTopics, articleCount }) {
+async function sendGenerateArticlesRequest({ headline, summary, topics, selectedTopics, articleCount, selectedTopicDetails = null }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
@@ -1086,6 +1086,7 @@ async function sendGenerateArticlesRequest({ headline, summary, topics, selected
         summary,
         topics,
         selected_topics: selectedTopics,
+        selected_topic_details: selectedTopicDetails,
         article_count: Number(articleCount || 1),
         article_type: 'Blog Article',
         target_audience: 'General readers',
@@ -1319,12 +1320,14 @@ async function handleDirectTopicArticleGeneration(topic) {
   renderApp();
 
   try {
+    const selectedTopicDetails = (appState.analysisResult?.topic_details || []).find((item) => item.title === topic) || null;
     const result = await sendGenerateArticlesRequest({
       headline: appState.analysisResult?.headline || 'Media summary',
       summary: appState.analysisResult?.summary || '',
       topics: appState.analysisResult?.topics || [],
       selectedTopics: [topic],
       articleCount: 1,
+      selectedTopicDetails,
     });
     appState.analysisResult = result;
     clearBusyStates();

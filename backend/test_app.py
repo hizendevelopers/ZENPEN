@@ -340,6 +340,7 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch, tmp_
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Instagram link https://instagram.com/test', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Systems, Planning, and National Coordination',
@@ -365,6 +366,7 @@ def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     download_calls = {'count': 0}
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: download_calls.__setitem__('count', download_calls['count'] + 1) or 'fake-audio.wav')
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
@@ -550,6 +552,7 @@ def test_analyze_endpoint_rejects_unsupported_upload_type():
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Systems, Planning, and National Coordination',
@@ -570,6 +573,7 @@ def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_pat
 def test_analyze_url_source_downloads_and_transcribes_youtube(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
     monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
     monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
@@ -606,7 +610,10 @@ def test_analyze_url_source_uses_real_webpage_content(monkeypatch):
 
 def test_analyze_youtube_source_falls_back_when_direct_analysis_fails(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
-    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: (_ for _ in ()).throw(RuntimeError('direct failed')))
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel'})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('direct failed')))
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
+    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('no subtitles')))
     monkeypatch.setattr('app.remote_media_fallback_available', lambda: True)
     monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'Recovered transcript from fallback path.')
@@ -621,6 +628,24 @@ def test_analyze_youtube_source_falls_back_when_direct_analysis_fails(monkeypatc
 
     assert result['topics'] == ['Recovered Topic']
     assert result['direct_analysis'] is False
+
+
+def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_fetch(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
+    monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel'})
+    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: {
+        'heading': 'Direct analysis heading',
+        'summary': 'Direct analysis summary.',
+        'key_points': ['Point one'],
+        'topics': [{'title': 'Direct Topic', 'points': [{'label': 'Point', 'description': 'Direct path worked.'}]}],
+    })
+    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(AssertionError('transcript should not run')))
+
+    result = analyze_youtube_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
+
+    assert result['heading'] == 'Direct analysis heading'
+    assert result['topics'] == ['Direct Topic']
+    assert result['direct_analysis'] is True
 
 
 def test_analyze_youtube_endpoint_uses_cache(monkeypatch):

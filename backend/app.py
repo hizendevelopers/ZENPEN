@@ -828,6 +828,10 @@ def gemini_generate_text(prompt: str) -> str:
         raise
 
 
+def get_gemini_model_name() -> str:
+    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
 def load_history() -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
@@ -1279,6 +1283,18 @@ def analysis_output_is_valid(result: dict[str, object]) -> bool:
     if len(unique_fragments) < max(4, len(normalized_fragments) // 3):
         return False
     return bool(heading.strip() and summary.strip() and isinstance(topics, list) and topics)
+
+
+def direct_gemini_failure_reason(exc: Exception) -> str:
+    message = str(exc or "").strip() or exc.__class__.__name__
+    lower = message.lower()
+    if "unsupported" in lower or "not supported" in lower:
+        return "The current Gemini request format does not support direct video URL analysis."
+    if "timeout" in lower:
+        return "The direct Gemini analysis request timed out."
+    if "could not analyze" in lower or "access" in lower:
+        return "Gemini could not access enough video content from the provided URL."
+    return message
 
 
 def clean_source_text(text: str) -> str:
@@ -2814,6 +2830,38 @@ Return JSON in this shape:
     return result
 
 
+def direct_gemini_youtube_analysis(url: str, query: str, metadata: Optional[dict[str, object]] = None) -> dict[str, object]:
+    model_name = get_gemini_model_name()
+    title_hint = sanitize_youtube_metadata_text(str((metadata or {}).get("title") or ""))
+    context = (
+        f"Video title hint: {title_hint}\n"
+        "Analyze the actual YouTube video content from the provided source URL.\n"
+        "Ignore metadata, description, URLs, credits, tags, channel info, and social media links.\n"
+    )
+    logger.info(
+        "youtube-direct-analysis-attempt | model=%s | request_type=text+url | url=%s",
+        model_name,
+        url,
+    )
+    try:
+        result = gemini_rag(context, query, source_url=url)
+        logger.info(
+            "youtube-direct-analysis-success | model=%s | request_type=text+url | url=%s",
+            model_name,
+            url,
+        )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "youtube-direct-analysis-failed | model=%s | request_type=text+url | url=%s | error_type=%s | error=%s",
+            model_name,
+            url,
+            exc.__class__.__name__,
+            str(exc),
+        )
+        raise RuntimeError(direct_gemini_failure_reason(exc)) from exc
+
+
 def generate_news_article(headline_text: str, summary_text: str, topic: Optional[str] = None) -> str:
     if not headline_text.strip():
         headline_text = "Media summary"
@@ -3105,7 +3153,7 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content", 
 def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress_callback=None) -> tuple[dict[str, str], str]:
     with tempfile.TemporaryDirectory(prefix="media-analyzer-youtube-fallback-") as temp_dir:
         if progress_callback:
-            progress_callback("fallback_transcription", "Direct video analysis failed. Trying audio transcription fallback...", 38)
+            progress_callback("fallback_transcription", "Direct analysis and captions fallback failed. Trying audio transcription fallback...", 38)
         temp_audio_path = run_with_timeout(
             "Video download",
             min(120, YOUTUBE_FALLBACK_TIMEOUT),
@@ -3143,44 +3191,78 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
     if progress_callback:
         progress_callback("analyzing_video", "Analyzing video with Gemini...", 12)
 
+    with profiler.stage("source_fetch_download"):
+        metadata = run_with_timeout("YouTube metadata analysis", 35, fetch_youtube_metadata, url)
+
     try:
-        with profiler.stage("source_fetch_download"):
-            metadata = run_with_timeout("YouTube metadata analysis", 35, fetch_youtube_metadata, url)
-        with tempfile.TemporaryDirectory(prefix="yt-direct-analysis-") as temp_dir:
-            try:
-                with profiler.stage("transcription"):
-                    transcript_text = run_with_timeout("YouTube transcript fetch", YOUTUBE_TRANSCRIPT_TIMEOUT, fetch_youtube_transcript_text, url)
-            except Exception:
-                try:
-                    with profiler.stage("transcription"):
-                        transcript_text = run_with_timeout("YouTube subtitle fetch", YOUTUBE_SUBTITLE_TIMEOUT, fetch_youtube_subtitles_text, url, temp_dir)
-                except Exception as subtitle_exc:
-                    direct_failure = subtitle_exc
-        with profiler.stage("transcript_cleaning"):
-            source_context = build_youtube_source_text(metadata, transcript_text)
-        if len(clean_source_text(transcript_text)) < 180:
-            raise RuntimeError("Gemini could not analyze the actual video content from quick transcript sources.")
-        if not source_context.strip():
-            raise RuntimeError("Gemini could not analyze the video from the available source data.")
-        if progress_callback:
-            progress_callback("extracting_topics", "Extracting headline, summary, and main topics...", 68)
         with profiler.stage("analysis_generation"):
-            analysis_input = build_chunk_safe_analysis_input(source_context, query or "Summarize the content", progress_callback=progress_callback)
-            chunks = chunk_text(analysis_input)
-            try:
-                with profiler.stage("topic_analysis_context"):
-                    context = build_analysis_context(analysis_input, chunks, query or "Summarize the content")
-            except Exception:
-                context = " ".join(chunks[:3])
-            result = gemini_rag(context, query or "Summarize the content", source_url=url)
-            cleaned_transcript = source_context
-        source_context = cleaned_transcript or source_context
+            result = run_with_timeout(
+                "YouTube direct Gemini analysis",
+                YOUTUBE_DIRECT_ANALYSIS_TIMEOUT,
+                direct_gemini_youtube_analysis,
+                url,
+                query or "Summarize the content",
+                metadata,
+            )
+        source_context = build_youtube_source_text(metadata, "")
     except Exception as direct_exc:
         direct_failure = direct_exc
-        if not remote_media_fallback_available():
-            raise RuntimeError("Gemini could not analyze the video directly, and fallback processing is not available.") from direct_exc
-        result, cleaned_transcript = analyze_youtube_via_transcription_fallback(url, query or "Summarize the content", progress_callback=progress_callback)
-        source_context = cleaned_transcript or source_context
+        logger.warning(
+            "youtube-direct-analysis-reason | url=%s | reason=%s",
+            url,
+            direct_gemini_failure_reason(direct_exc),
+        )
+        if progress_callback:
+            progress_callback(
+                "transcription",
+                "Direct video analysis failed. Trying captions/transcript fallback...",
+                28,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="yt-direct-analysis-") as temp_dir:
+            captions_error: Optional[Exception] = None
+            try:
+                with profiler.stage("transcription"):
+                    transcript_text = run_with_timeout("YouTube transcript fetch", min(30, YOUTUBE_TRANSCRIPT_TIMEOUT), fetch_youtube_transcript_text, url)
+            except Exception as transcript_exc:
+                logger.warning(
+                    "youtube-transcript-fetch-failed | url=%s | error_type=%s | error=%s",
+                    url,
+                    transcript_exc.__class__.__name__,
+                    str(transcript_exc),
+                )
+                try:
+                    with profiler.stage("transcription"):
+                        transcript_text = run_with_timeout("YouTube subtitle fetch", min(30, YOUTUBE_SUBTITLE_TIMEOUT), fetch_youtube_subtitles_text, url, temp_dir)
+                except Exception as subtitle_exc:
+                    logger.warning(
+                        "youtube-subtitle-fetch-failed | url=%s | error_type=%s | error=%s",
+                        url,
+                        subtitle_exc.__class__.__name__,
+                        str(subtitle_exc),
+                    )
+                    captions_error = subtitle_exc
+
+        if transcript_text.strip():
+            if progress_callback:
+                progress_callback("extracting_topics", "Extracting headline, summary, and main topics...", 68)
+            with profiler.stage("transcript_cleaning"):
+                source_context = build_youtube_source_text(metadata, transcript_text)
+            with profiler.stage("analysis_generation"):
+                analysis_input = build_chunk_safe_analysis_input(source_context, query or "Summarize the content", progress_callback=progress_callback)
+                chunks = chunk_text(analysis_input)
+                try:
+                    with profiler.stage("topic_analysis_context"):
+                        context = build_analysis_context(analysis_input, chunks, query or "Summarize the content")
+                except Exception:
+                    context = " ".join(chunks[:3])
+                result = gemini_rag(context, query or "Summarize the content", source_url=url)
+            source_context = source_context
+        else:
+            if not remote_media_fallback_available():
+                raise RuntimeError("Gemini direct analysis failed and no captions/transcript were available.") from captions_error or direct_exc
+            result, cleaned_transcript = analyze_youtube_via_transcription_fallback(url, query or "Summarize the content", progress_callback=progress_callback)
+            source_context = cleaned_transcript or source_context
 
     if progress_callback:
         progress_callback("finalizing_output", "Finalizing headline, summary, and topic list...", 94)

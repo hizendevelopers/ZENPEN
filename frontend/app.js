@@ -285,12 +285,11 @@ function startBusyStatusTimer(mode) {
   stopBusyStatusTimer();
   const stagesByMode = {
     analyzing: [
-      { delay: 12000, message: 'Preparing source and extracting usable content...' },
-      { delay: 22000, message: 'This is taking longer than usual. We are optimizing the article from your source.' },
+      { delay: 8000, message: 'Extracting headline, summary, and topics...' },
+      { delay: 22000, message: 'Analysis is taking longer than expected. Please retry or use a shorter source.' },
     ],
     articles: [
-      { delay: 8000, message: 'Generating article draft from your source...' },
-      { delay: 16000, message: 'Refining output and checking article quality...' },
+      { delay: 8000, message: 'Polishing article...' },
       { delay: 26000, message: 'This is taking longer than usual. We are optimizing the article from your source.' },
     ],
   };
@@ -309,6 +308,41 @@ function startBusyStatusTimer(mode) {
     }, stage.delay);
   };
   scheduleNext();
+}
+
+function syncSourceInputs() {
+  const form = document.getElementById('article-generator-form');
+  if (!form) return;
+  const urlInput = form.querySelector('#url-input');
+  const fileInput = form.querySelector('#file-input');
+  const fileHelper = form.querySelector('#file-helper');
+  const urlHelper = form.querySelector('#url-helper');
+  const clearUrlButton = form.querySelector('[data-action="clear-url"]');
+  const clearFileButton = form.querySelector('[data-action="clear-file"]');
+  if (!(urlInput instanceof HTMLInputElement) || !(fileInput instanceof HTMLInputElement)) return;
+
+  const hasUrl = Boolean(urlInput.value.trim());
+  const hasFile = Boolean(fileInput.files?.length);
+
+  urlInput.disabled = hasFile;
+  fileInput.disabled = hasUrl;
+
+  if (fileHelper) {
+    fileHelper.textContent = hasUrl
+      ? 'Clear the URL if you want to switch to file upload.'
+      : 'Select an audio or video file if you do not want to use a URL.';
+  }
+  if (urlHelper) {
+    urlHelper.textContent = hasFile
+      ? 'Reset the selected file if you want to switch back to a URL.'
+      : 'Paste a webpage or YouTube/video URL.';
+  }
+  if (clearUrlButton instanceof HTMLButtonElement) {
+    clearUrlButton.disabled = !hasUrl;
+  }
+  if (clearFileButton instanceof HTMLButtonElement) {
+    clearFileButton.disabled = !hasFile;
+  }
 }
 
 function clearBusyStates() {
@@ -420,11 +454,6 @@ function buildLandingPage() {
       </div>
       <div class="product-grid">
         ${PRODUCTS.map((product) => buildProductCard(product, !isAuthenticated())).join('')}
-      </div>
-      <div class="sample-preview">
-        <span class="eyebrow">Sample Output Preview</span>
-        <h3>What users can expect before generating</h3>
-        <p>A polished headline, cleaned summary, dynamic topic ideas, article-type-aware structure, SEO metadata, and export-ready content blocks.</p>
       </div>
     </section>
 
@@ -737,19 +766,26 @@ function buildAnalysisSummary() {
 
   const result = appState.analysisResult;
   const summaryItems = parseSummaryToList(result.summary);
+  const keyPoints = result.key_points?.length ? result.key_points : summaryItems;
   return `
     <div class="analysis-result-card">
       <span class="eyebrow">Analysis Output</span>
       <h2>${escapeHtml(result.headline)}</h2>
       ${result.topic_generation_warning ? `<div class="state-banner empty-state inline-state">${escapeHtml(result.topic_generation_warning)}</div>` : ''}
+      <div class="analysis-grid">
         <div class="summary-block">
           <h3>Summary</h3>
+          <p>${escapeHtml(summaryItems[0] || stripHtmlToText(result.summary || ''))}</p>
+        </div>
+        <div class="summary-block">
+          <h3>Key Points</h3>
           <ul>
-            ${summaryItems.map((item) => `<li>${item}</li>`).join('')}
+            ${keyPoints.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
           </ul>
         </div>
       </div>
-    `;
+    </div>
+  `;
 }
 
 function buildTopicSelector() {
@@ -775,31 +811,17 @@ function buildTopicSelector() {
         <span class="eyebrow">Detected Topics</span>
         <h3>Select one topic for article generation</h3>
       </div>
-        <div class="topic-form">
-        <div class="topic-actions two-row-actions">
-          <label>
-            Article type
-            <select id="article-type-input" name="article_type">
-              ${['Blog Article', 'News Article', 'How-to Guide', 'Listicle', 'Review', 'SEO Article'].map((type) => `
-                <option value="${escapeHtml(type)}" ${appState.formValues.articleType === type ? 'selected' : ''}>${escapeHtml(type)}</option>
-              `).join('')}
-            </select>
-          </label>
-          <label>
-            Target audience
-            <input id="target-audience-input" name="target_audience" type="text" value="${escapeHtml(appState.formValues.targetAudience)}" placeholder="General readers" />
-          </label>
+      <div class="topic-form">
+        <div class="topic-selector-grid">
+          ${topicDetails.map((topic) => `
+            <article class="topic-option ${selectedTopic === topic.title ? 'topic-option-active' : ''}">
+              <span class="topic-pill">${escapeHtml(topic.title)}</span>
+              ${topic.explanation ? `<p class="topic-option-copy">${topic.explanation}</p>` : ''}
+              ${topic.importance ? `<p class="topic-option-note">${topic.importance}</p>` : ''}
+              <button class="primary-btn topic-generate-btn" type="button" data-action="generate-topic-article" data-topic-title="${escapeHtml(topic.title)}" ${appState.busyMode === 'articles' ? 'disabled' : ''}>Generate Article</button>
+            </article>
+          `).join('')}
         </div>
-          <div class="topic-selector-list">
-            ${topicDetails.map((topic) => `
-              <article class="topic-option ${selectedTopic === topic.title ? 'topic-option-active' : ''}">
-                <span class="topic-pill">${escapeHtml(topic.title)}</span>
-                ${topic.explanation ? `<span class="topic-option-copy">${topic.explanation}</span>` : ''}
-                ${topic.importance ? `<span class="topic-option-note">${topic.importance}</span>` : ''}
-                <button class="primary-btn" type="button" data-action="generate-topic-article" data-topic-title="${escapeHtml(topic.title)}" ${appState.busyMode === 'articles' ? 'disabled' : ''}>Generate Article</button>
-              </article>
-            `).join('')}
-          </div>
         ${articleState}
       </div>
     </section>
@@ -822,7 +844,6 @@ function buildArticlesSection() {
           <span class="eyebrow">Generated Articles</span>
           <h3>Complete article output</h3>
         </div>
-        <button class="ghost-btn" data-action="download-all-articles">Download All</button>
       </div>
       ${appState.exportMessage ? `<div class="state-banner loading-state inline-state"><div class="loader small-loader"></div><span>${escapeHtml(appState.exportMessage)}</span></div>` : ''}
       ${appState.successMessage ? `<div class="state-banner loading-state inline-state">${escapeHtml(appState.successMessage)}</div>` : ''}
@@ -833,44 +854,25 @@ function buildArticlesSection() {
             <div class="article-image-wrap">
               <img src="${escapeHtml(article.image_url || '')}" alt="${escapeHtml(article.topic)} article image" />
             </div>
-              <div class="article-output-body">
-                <div class="article-card-header">
-                  <div>
-                    <span class="topic-tag">${escapeHtml(article.topic)}</span>
-                    <h4>${escapeHtml(article.meta_title || appState.analysisResult.headline)}</h4>
-                  </div>
-                <div class="article-actions">
+            <div class="article-output-body">
+              <div class="article-card-header article-card-header-inline">
+                <div class="article-actions article-actions-left">
                   <button class="secondary-btn" data-action="copy-article" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>Copy</button>
-                  <button class="secondary-btn" data-action="copy-html" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>Copy HTML</button>
-                  <button class="secondary-btn" data-action="download-article" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>TXT</button>
-                  <button class="secondary-btn" data-action="download-docx" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>DOCX</button>
-                  <button class="secondary-btn" data-action="download-pdf" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>PDF</button>
-                  <button class="secondary-btn" data-action="publish-draft" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>Publish Draft</button>
-                </div>
-              </div>
-                <div class="article-meta-grid">
-                  <div><strong>Article Type</strong><span>${escapeHtml(article.article_type || appState.formValues.articleType)}</span></div>
-                  <div><strong>Slug</strong><span>${escapeHtml(article.slug || '')}</span></div>
-                  <div><strong>Focus Keyword</strong><span>${escapeHtml(article.focus_keyword || article.topic)}</span></div>
-                  <div><strong>Meta Description</strong><span>${escapeHtml(article.meta_description || '')}</span></div>
-                  <div><strong>Secondary Keywords</strong><span>${escapeHtml((article.secondary_keywords || []).join(', '))}</span></div>
-                  <div><strong>GEO Keywords</strong><span>${escapeHtml((article.geo_keywords || []).join(', '))}</span></div>
-                </div>
-                ${article.seo_report ? `
-                  <div class="score-card">
-                    <div class="score-strip">
-                      <span><strong>SEO</strong> ${article.seo_report.seoScore}/10</span>
-                      <span><strong>GEO</strong> ${article.seo_report.geoScore}/10</span>
+                  <details class="download-menu">
+                    <summary class="secondary-btn" ${appState.exportBusy ? 'aria-disabled="true"' : ''}>Download</summary>
+                    <div class="download-menu-list">
+                      <button class="secondary-btn" type="button" data-action="download-docx" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>DOCX</button>
+                      <button class="secondary-btn" type="button" data-action="download-pdf" data-article-index="${index}" ${appState.exportBusy ? 'disabled' : ''}>PDF</button>
                     </div>
-                    ${(article.seo_report.improvementSuggestions || []).length ? `
-                      <ul class="score-suggestions">
-                        ${(article.seo_report.improvementSuggestions || []).map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
-                      </ul>
-                    ` : '<p class="score-pass">The article passed the current SEO/GEO checks cleanly.</p>'}
-                  </div>
-                ` : ''}
-                <div class="article-content">${article.content || ''}</div>
+                  </details>
+                </div>
+                <div class="article-heading-block">
+                  <span class="topic-tag">${escapeHtml(article.topic)}</span>
+                  <h4>${escapeHtml(article.meta_title || appState.analysisResult.headline)}</h4>
+                </div>
               </div>
+              <div class="article-content article-content-wide">${article.content || ''}</div>
+            </div>
             </article>
           `).join('')}
         </div>
@@ -879,7 +881,7 @@ function buildArticlesSection() {
 }
 
 function buildArticleGeneratorPage() {
-  const uploadMode = appState.sourceMode === 'upload';
+  const hasUrl = Boolean(appState.formValues.url?.trim());
   return `
     <section class="generator-hero">
       <div>
@@ -890,45 +892,38 @@ function buildArticleGeneratorPage() {
       <a class="ghost-btn" href="/dashboard">Back to Dashboard</a>
     </section>
 
-    <section class="generator-grid">
-      <div class="panel analysis-form-panel">
-        <h2>Step 1: Analyze Source Content</h2>
-        <div class="sample-preview">
-          <span class="eyebrow">Sample Preview</span>
-          <h3>What the output looks like</h3>
-          <p>A cleaned headline, dynamic topics, article-type-aware writing, SEO metadata, and export-ready content.</p>
-        </div>
+    <section class="generator-stack">
+      <div class="panel analysis-form-panel analysis-form-wide">
+        <h2>Analyze Source Content</h2>
         <form id="article-generator-form" class="product-form">
-          <div class="source-mode-group">
-            <label class="mode-chip">
-              <input type="radio" name="source_mode" value="url" ${!uploadMode ? 'checked' : ''} />
-              <span>Paste URL</span>
+          <div class="source-input-row">
+            <label>
+              Enter a URL
+              <div class="input-with-action">
+                <input id="url-input" name="url" type="url" placeholder="https://example.com/article or https://www.youtube.com/watch?v=..." value="${escapeHtml(appState.formValues.url)}" />
+                <button class="ghost-btn inline-clear-btn" type="button" data-action="clear-url" ${hasUrl ? '' : 'disabled'}>Clear</button>
+              </div>
+              <span id="url-helper" class="field-helper">Paste a webpage or YouTube/video URL.</span>
             </label>
-            <label class="mode-chip">
-              <input type="radio" name="source_mode" value="upload" ${uploadMode ? 'checked' : ''} />
-              <span>Upload audio/video</span>
+            <label>
+              Upload an audio or video file
+              <div class="input-with-action file-input-shell">
+                <input id="file-input" name="file" type="file" accept="audio/*,video/*" />
+                <button class="ghost-btn inline-clear-btn" type="button" data-action="clear-file">Reset</button>
+              </div>
+              <span id="file-helper" class="field-helper">Select an audio or video file if you do not want to use a URL.</span>
             </label>
           </div>
           <label>
-            Enter a URL
-            <input id="url-input" name="url" type="url" placeholder="https://example.com/article or https://www.youtube.com/watch?v=..." value="${escapeHtml(appState.formValues.url)}" ${uploadMode ? 'disabled' : ''} />
-          </label>
-          <div class="or-divider">or</div>
-          <label>
-            Upload an audio or video file
-            <input id="file-input" name="file" type="file" accept="audio/*,video/*" ${uploadMode ? '' : 'disabled'} />
-            <span class="field-helper">${uploadMode ? 'Audio and video uploads are enabled.' : 'Select the upload mode to enable file selection.'}</span>
-          </label>
-          <label>
             Analysis prompt
-            <input id="query-input" name="query" type="text" value="${escapeHtml(appState.formValues.query)}" />
+            <input id="query-input" name="query" type="text" value="${escapeHtml(appState.formValues.query)}" placeholder="Tell us what you want from this video or URL, e.g. 'Give me breaking news and main points'" />
           </label>
           <button class="primary-btn wide-btn" type="submit" ${appState.busyMode === 'analyzing' ? 'disabled' : ''}>Analyze Content</button>
           <p class="field-helper">Supported direct inputs: webpages, article URLs, YouTube/video links, and uploaded audio/video files. Image URLs are not supported yet.</p>
         </form>
       </div>
 
-      <div class="analysis-output-column">
+      <div class="analysis-output-column full-width-output">
         ${buildAnalysisSummary()}
         ${buildTopicSelector()}
         ${buildArticlesSection()}
@@ -989,10 +984,9 @@ function renderApp() {
   `;
 }
 
-function validateAnalysisInput(url, file, sourceMode) {
-  if (sourceMode === 'upload' && !file) return 'Please choose an audio or video file to upload.';
-  if (sourceMode !== 'upload' && !url) return 'Please provide a valid URL to analyze.';
+function validateAnalysisInput(url, file) {
   if (!url && !file) return 'Please provide a URL or upload an audio/video file.';
+  if (url && file) return 'Please use either a URL or one uploaded file at a time.';
   if (url) {
     try {
       new URL(url);
@@ -1059,7 +1053,7 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source, end
     return payload;
   } catch (error) {
     if (error.name === 'AbortError') {
-      throw new Error('This video is long, so we are transcribing it in parts. Please wait while we process it.');
+      throw new Error('Analysis is taking longer than expected. Please retry or use a shorter source.');
     }
     throw new Error(mapUserFacingError(error));
   } finally {
@@ -1071,7 +1065,7 @@ async function sendGenerateArticlesRequest({ headline, summary, topics, selected
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
-    const response = await fetch('/api/articles', {
+    const response = await fetch('/api/generate-article', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1083,8 +1077,8 @@ async function sendGenerateArticlesRequest({ headline, summary, topics, selected
         topics,
         selected_topics: selectedTopics,
         article_count: Number(articleCount || 1),
-        article_type: appState.formValues.articleType || 'Blog Article',
-        target_audience: appState.formValues.targetAudience || 'General readers',
+        article_type: 'Blog Article',
+        target_audience: 'General readers',
         source_context: appState.analysisResult?.source_context_preview || appState.analysisResult?.summary || '',
         source_cache_key: appState.analysisResult?.source_cache_key || '',
       }),
@@ -1130,7 +1124,7 @@ function startAnalysisPolling(jobId) {
       }
       if (payload.status === 'completed' && payload.result) {
         appState.analysisResult = payload.result;
-        appState.selectedTopics = payload.result.topics ? payload.result.topics.slice(0, 3) : [];
+        appState.selectedTopics = payload.result.topics ? payload.result.topics.slice(0, 1) : [];
         clearBusyStates();
         renderApp();
         return;
@@ -1239,12 +1233,10 @@ async function publishArticleDraft(article) {
 async function handleAnalyzeSubmit(form) {
   if (appState.busyMode === 'analyzing') return;
   const fileInput = form.querySelector('#file-input');
-  const sourceMode = form.querySelector('input[name="source_mode"]:checked')?.value || 'url';
   const url = form.querySelector('#url-input').value.trim();
   const query = form.querySelector('#query-input').value.trim() || 'Give breaking news and main points';
   const file = fileInput?.files?.[0] || null;
-
-  const validationMessage = validateAnalysisInput(url, file, sourceMode);
+  const validationMessage = validateAnalysisInput(url, file);
   if (validationMessage) {
     appState.analysisError = validationMessage;
     appState.articleError = '';
@@ -1252,6 +1244,7 @@ async function handleAnalyzeSubmit(form) {
     return;
   }
 
+  const sourceMode = file ? 'upload' : 'url';
   appState.sourceMode = sourceMode;
   appState.formValues.url = url;
   appState.formValues.query = query;
@@ -1288,58 +1281,13 @@ async function handleAnalyzeSubmit(form) {
       }
       const result = payload.result;
       appState.analysisResult = result;
-      appState.selectedTopics = result.topics ? result.topics.slice(0, 3) : [];
+      appState.selectedTopics = result.topics ? result.topics.slice(0, 1) : [];
       clearBusyStates();
       renderApp();
     } catch (error) {
       appState.analysisError = mapUserFacingError(error);
       clearBusyStates();
       renderApp();
-  }
-}
-
-async function handleArticleGeneration(form) {
-  if (appState.busyMode === 'articles') return;
-  if (!appState.analysisResult) {
-    appState.articleError = 'Analyze content first before generating articles.';
-    renderApp();
-    return;
-  }
-
-  const selectedTopics = Array.from(form.querySelectorAll('input[name="selected-topic"]:checked')).map((input) => input.value);
-  if (!selectedTopics.length) {
-    appState.articleError = 'Select at least one topic before generating articles.';
-    renderApp();
-    return;
-  }
-
-  appState.selectedTopics = selectedTopics;
-  appState.formValues.articleCount = form.querySelector('#article-count-input').value || '1';
-  appState.formValues.articleType = form.querySelector('#article-type-input').value || 'Blog Article';
-  appState.formValues.targetAudience = form.querySelector('#target-audience-input').value.trim() || 'General readers';
-  appState.articleError = '';
-  appState.publishError = '';
-  appState.successMessage = '';
-  appState.busyMode = 'articles';
-  appState.busyMessage = `Generating a ${appState.formValues.articleType.toLowerCase()} for your selected topics...`;
-  startBusyStatusTimer('articles');
-  renderApp();
-
-  try {
-    const result = await sendGenerateArticlesRequest({
-      headline: appState.analysisResult?.headline || 'Media summary',
-      summary: appState.analysisResult?.summary || '',
-      topics: appState.analysisResult?.topics || [],
-      selectedTopics,
-      articleCount: appState.formValues.articleCount,
-    });
-    appState.analysisResult = result;
-    clearBusyStates();
-    renderApp();
-  } catch (error) {
-    appState.articleError = mapUserFacingError(error);
-    clearBusyStates();
-    renderApp();
   }
 }
 
@@ -1350,11 +1298,7 @@ async function handleDirectTopicArticleGeneration(topic) {
     renderApp();
     return;
   }
-  const articleTypeInput = document.getElementById('article-type-input');
-  const targetAudienceInput = document.getElementById('target-audience-input');
   appState.selectedTopics = [topic];
-  appState.formValues.articleType = articleTypeInput?.value || appState.formValues.articleType || 'Blog Article';
-  appState.formValues.targetAudience = targetAudienceInput?.value?.trim() || appState.formValues.targetAudience || 'General readers';
   appState.formValues.articleCount = '1';
   appState.articleError = '';
   appState.publishError = '';
@@ -1503,10 +1447,9 @@ async function copyArticle(article, index) {
 
 function attachDelegatedHandlers() {
   document.addEventListener('change', (event) => {
-    if (event.target.name === 'source_mode') {
-      appState.sourceMode = event.target.value;
-      renderApp();
-      return;
+    const target = event.target;
+    if (target instanceof HTMLInputElement && target.id === 'file-input') {
+      syncSourceInputs();
     }
   });
 
@@ -1520,6 +1463,10 @@ function attachDelegatedHandlers() {
     }
     if (form.id === 'signup-form') {
       appState.authForms.signup[target.name] = target.value;
+    }
+    if (form.id === 'article-generator-form' && target.id === 'url-input') {
+      appState.formValues.url = target.value;
+      syncSourceInputs();
     }
   });
 
@@ -1535,10 +1482,6 @@ function attachDelegatedHandlers() {
     if (event.target.id === 'article-generator-form') {
       event.preventDefault();
       handleAnalyzeSubmit(event.target);
-    }
-    if (event.target.id === 'topic-selection-form') {
-      event.preventDefault();
-      handleArticleGeneration(event.target);
     }
   });
 
@@ -1584,17 +1527,6 @@ function attachDelegatedHandlers() {
       return;
     }
 
-      if (button.dataset.action === 'download-all-articles') {
-        const articles = appState.analysisResult?.articles || [];
-        const payload = articles
-          .map((article, index) => `Article ${index + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`)
-          .join('\n\n' + '-'.repeat(80) + '\n\n');
-        downloadTextFile('generated-articles.txt', payload);
-        appState.successMessage = 'All generated articles were downloaded.';
-        renderApp();
-        return;
-      }
-
     if (button.dataset.action === 'copy-article') {
       const articleIndex = Number(button.dataset.articleIndex);
       const article = appState.analysisResult?.articles?.[articleIndex];
@@ -1604,27 +1536,6 @@ function attachDelegatedHandlers() {
       renderApp();
       return;
     }
-
-      if (button.dataset.action === 'download-article') {
-        const articleIndex = Number(button.dataset.articleIndex);
-        const article = appState.analysisResult?.articles?.[articleIndex];
-        if (!article) return;
-        const safeTopic = article.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `article-${articleIndex + 1}`;
-        downloadTextFile(`${safeTopic}.txt`, `Article ${articleIndex + 1}: ${article.topic}\n\n${stripHtmlToText(article.content)}`);
-        appState.successMessage = 'TXT export is ready.';
-        renderApp();
-        return;
-      }
-
-      if (button.dataset.action === 'copy-html') {
-        const articleIndex = Number(button.dataset.articleIndex);
-        const article = appState.analysisResult?.articles?.[articleIndex];
-        if (!article) return;
-        await navigator.clipboard.writeText(article.content || '');
-        appState.successMessage = 'HTML copied to clipboard.';
-        renderApp();
-        return;
-      }
 
       if (button.dataset.action === 'download-docx' || button.dataset.action === 'download-pdf') {
         const articleIndex = Number(button.dataset.articleIndex);
@@ -1647,23 +1558,21 @@ function attachDelegatedHandlers() {
         return;
       }
 
-      if (button.dataset.action === 'publish-draft') {
-        const articleIndex = Number(button.dataset.articleIndex);
-        const article = appState.analysisResult?.articles?.[articleIndex];
-        if (!article) return;
-        appState.exportBusy = 'publish';
-        appState.exportMessage = 'Saving your draft...';
-        appState.publishError = '';
-        renderApp();
-        try {
-          await publishArticleDraft(article);
-          appState.successMessage = 'Draft saved successfully.';
-        } catch (error) {
-          appState.publishError = mapUserFacingError(error);
-        } finally {
-          appState.exportBusy = '';
-          appState.exportMessage = '';
-          renderApp();
+      if (button.dataset.action === 'clear-url') {
+        const urlInput = document.getElementById('url-input');
+        if (urlInput instanceof HTMLInputElement) {
+          urlInput.value = '';
+          appState.formValues.url = '';
+          syncSourceInputs();
+        }
+        return;
+      }
+
+      if (button.dataset.action === 'clear-file') {
+        const fileInput = document.getElementById('file-input');
+        if (fileInput instanceof HTMLInputElement) {
+          fileInput.value = '';
+          syncSourceInputs();
         }
       }
   });
@@ -1681,5 +1590,12 @@ window.addEventListener('popstate', () => {
 if (!window.location.pathname) {
   navigate('/', { replace: true });
 }
+const __renderApp = renderApp;
+renderApp = function wrappedRenderApp() {
+  __renderApp();
+  window.requestAnimationFrame(() => {
+    syncSourceInputs();
+  });
+};
 renderApp();
 initializeApp();

@@ -2621,6 +2621,10 @@ def get_topics_from_summary(summary_text: str) -> list[str]:
     return [item["title"] for item in get_topic_details_from_summary(summary_text)]
 
 
+def summary_to_key_points(summary_text: str) -> list[str]:
+    return [line[2:].strip() for line in summary_text.splitlines() if line.strip().startswith("- ")]
+
+
 def enrich_analysis(
     result: dict[str, str],
     generate_article: bool = False,
@@ -2638,11 +2642,13 @@ def enrich_analysis(
             source_context = str(cached_source["content"])
     headline = result.get("headline", "Media summary")
     summary = result.get("summary", "")
+    key_points = summary_to_key_points(summary)
     topic_details, used_fallback_topics = build_topic_details_bundle(summary)
     topics = [item["title"] for item in topic_details]
     payload: dict[str, object] = {
         "headline": headline,
         "summary": summary,
+        "key_points": key_points,
         "topics": topics,
         "topic_details": topic_details,
         "articles": [],
@@ -2660,7 +2666,7 @@ def enrich_analysis(
     if not generate_article:
         return payload
 
-    topics_to_use = selected_topics or topics[:3] or ["Main topic"]
+    topics_to_use = (selected_topics[:1] if selected_topics else topics[:1]) or ["Main topic"]
     work_items: list[tuple[int, str, int]] = []
     for topic_index, topic in enumerate(topics_to_use):
         for variant_index in range(max(article_count, 1)):
@@ -3305,6 +3311,31 @@ def analyze_youtube_endpoint(payload: AnalyzeYouTubeRequest, request: Request) -
     except Exception as exc:
         logger.exception("youtube-analyze-failed")
         return JSONResponse({"success": False, "error": map_public_error_message(str(exc))}, status_code=500)
+
+
+@app.post("/api/analyze-source")
+async def analyze_source_alias_endpoint(
+    request: Request,
+    url: Optional[str] = Form(None),
+    query: Optional[str] = Form("Summarize the content"),
+    file: Optional[UploadFile] = File(None),
+    generate_article: bool = Form(False),
+    article_count: int = Form(1),
+    selected_topics: Optional[str] = Form(None),
+    article_type: str = Form("Blog Article"),
+    target_audience: str = Form("General readers"),
+) -> JSONResponse:
+    return await analyze_endpoint(
+        request=request,
+        url=url,
+        query=query,
+        file=file,
+        generate_article=generate_article,
+        article_count=article_count,
+        selected_topics=selected_topics,
+        article_type=article_type,
+        target_audience=target_audience,
+    )
 
 
 @app.post("/api/articles")

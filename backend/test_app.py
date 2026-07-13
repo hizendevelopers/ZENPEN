@@ -274,7 +274,7 @@ def test_download_audio_raises_apify_error_directly_for_youtube(monkeypatch, tmp
     try:
         download_audio('https://www.youtube.com/watch?v=abc123', str(tmp_path))
     except RuntimeError as exc:
-        assert 'Apify YouTube download failed' in str(exc)
+        assert 'Apify fallback also failed' in str(exc) or 'Apify YouTube download failed' in str(exc)
     else:
         raise AssertionError('Expected RuntimeError')
 
@@ -574,6 +574,31 @@ def test_analyze_endpoint_accepts_pasted_transcript(monkeypatch):
     assert payload['success'] is True
     assert payload['result']['headline'] == 'Transcript-based heading'
     assert payload['result']['topics'] == ['Transcript Topic']
+
+
+def test_download_audio_prefers_ytdlp_before_apify_for_youtube(monkeypatch, tmp_path):
+    calls = {'ytdlp': 0, 'apify': 0}
+
+    monkeypatch.setattr('app.is_youtube_url', lambda url: True)
+    monkeypatch.setattr('app.download_audio_via_ytdlp', lambda url, output_dir: calls.__setitem__('ytdlp', calls['ytdlp'] + 1) or 'direct.wav')
+    monkeypatch.setattr('app.download_audio_via_apify', lambda url, output_dir: calls.__setitem__('apify', calls['apify'] + 1) or 'apify.wav')
+
+    result = download_audio('https://www.youtube.com/watch?v=abc123', str(tmp_path))
+
+    assert result == 'direct.wav'
+    assert calls['ytdlp'] == 1
+    assert calls['apify'] == 0
+
+
+def test_download_audio_uses_apify_when_ytdlp_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr('app.is_youtube_url', lambda url: True)
+    monkeypatch.setattr('app.APIFY_TOKEN', 'token-123')
+    monkeypatch.setattr('app.download_audio_via_ytdlp', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('direct failed')))
+    monkeypatch.setattr('app.download_audio_via_apify', lambda url, output_dir: 'apify.wav')
+
+    result = download_audio('https://www.youtube.com/watch?v=abc123', str(tmp_path))
+
+    assert result == 'apify.wav'
 
 
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_path):

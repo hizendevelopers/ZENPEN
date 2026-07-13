@@ -2075,13 +2075,7 @@ def select_best_audio_format_id(info: dict[str, object]) -> Optional[str]:
     return None
 
 
-def download_audio(url: str, output_dir: str) -> str:
-    if APIFY_TOKEN and is_youtube_url(url):
-        try:
-            return download_audio_via_apify(url, output_dir)
-        except Exception as exc:
-            raise RuntimeError(f"Apify YouTube download failed: {exc}") from exc
-
+def download_audio_via_ytdlp(url: str, output_dir: str) -> str:
     yt_dlp = get_yt_dlp_module()
     ensure_ffmpeg()
 
@@ -2131,7 +2125,7 @@ def download_audio(url: str, output_dir: str) -> str:
             info = ydl.extract_info(url, download=False)
         selected_format_id = select_best_audio_format_id(info)
         ydl_opts = dict(ydl_base_opts)
-        ydl_opts["format"] = selected_format_id or "bestaudio/best"
+        ydl_opts["format"] = selected_format_id or "worstaudio/bestaudio/best"
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -2166,6 +2160,33 @@ def download_audio(url: str, output_dir: str) -> str:
     if not wav_files:
         raise RuntimeError("Audio download completed, but no WAV file was produced.")
     return str(wav_files[0])
+
+
+def download_audio(url: str, output_dir: str) -> str:
+    direct_error: Optional[Exception] = None
+
+    if is_youtube_url(url):
+        try:
+            logger.info("youtube-download | method=ytdlp | url=%s", url)
+            return download_audio_via_ytdlp(url, output_dir)
+        except Exception as exc:
+            direct_error = exc
+            logger.warning("youtube-download | method=ytdlp | status=failed | url=%s | error=%s", url, exc)
+
+        if APIFY_TOKEN:
+            try:
+                logger.info("youtube-download | method=apify | url=%s", url)
+                return download_audio_via_apify(url, output_dir)
+            except Exception as exc:
+                logger.warning("youtube-download | method=apify | status=failed | url=%s | error=%s", url, exc)
+                if direct_error is not None:
+                    raise RuntimeError(f"Direct YouTube download failed: {direct_error}. Apify fallback also failed: {exc}") from exc
+                raise RuntimeError(f"Apify YouTube download failed: {exc}") from exc
+
+        if direct_error is not None:
+            raise direct_error
+
+    return download_audio_via_ytdlp(url, output_dir)
 
 
 def extract_audio_from_video(video_path: str, output_audio_path: str) -> str:

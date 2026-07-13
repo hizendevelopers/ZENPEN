@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -92,6 +93,9 @@ YOUTUBE_FALLBACK_TIMEOUT = int(os.getenv("YOUTUBE_FALLBACK_TIMEOUT", "180"))
 ENABLE_DIRECT_GEMINI_YOUTUBE_ANALYSIS = os.getenv("ENABLE_DIRECT_GEMINI_YOUTUBE_ANALYSIS", "false").strip().lower() in {"1", "true", "yes", "on"}
 ANALYSIS_JOB_MAX_SECONDS = int(os.getenv("ANALYSIS_JOB_MAX_SECONDS", "480"))
 ANALYSIS_JOB_STALE_SECONDS = int(os.getenv("ANALYSIS_JOB_STALE_SECONDS", "150"))
+GEMINI_MEDIA_UPLOAD_TIMEOUT = int(os.getenv("GEMINI_MEDIA_UPLOAD_TIMEOUT", "90"))
+GEMINI_MEDIA_TRANSCRIPTION_TIMEOUT = int(os.getenv("GEMINI_MEDIA_TRANSCRIPTION_TIMEOUT", "120"))
+GEMINI_FILE_READY_POLL_SECONDS = float(os.getenv("GEMINI_FILE_READY_POLL_SECONDS", "2"))
 GEMINI_BACKOFF_UNTIL = 0.0
 APP_ENV = os.getenv("APP_ENV", os.getenv("ENV", "development")).strip().lower()
 
@@ -417,10 +421,10 @@ def map_public_error_message(raw_message: str, *, context: str = "analysis") -> 
     if "rate" in lower and "limit" in lower:
         return "The AI service is busy right now. Please wait a moment and try again."
     if "timeout" in lower:
-        if "youtube metadata analysis" in lower or "youtube transcript fetch" in lower or "youtube subtitle fetch" in lower:
-            return "Direct video analysis timed out. Please retry or try another video."
-        if "transcription fallback" in lower or "video download" in lower:
-            return "Fallback processing timed out before the video could be transcribed."
+        if "youtube metadata analysis" in lower:
+            return "The video details could not be loaded in time. Please retry."
+        if "transcription fallback" in lower or "video download" in lower or "gemini media transcription" in lower:
+            return "The video could not be transcribed in time. Please retry or upload the audio/video file directly."
         return "The request took too long to complete. Please try again."
     if "private" in lower or "unavailable" in lower:
         return "Source is private or unavailable."
@@ -805,6 +809,104 @@ def get_genai_client():
         genai = get_genai_module()
         GENAI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
     return GENAI_CLIENT
+
+
+def infer_media_mime_type(file_path: str) -> str:
+    guessed, _ = mimetypes.guess_type(file_path)
+    if guessed:
+        return guessed
+    suffix = Path(file_path).suffix.lower()
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix in {".m4a", ".aac"}:
+        return "audio/mp4"
+    if suffix in {".ogg", ".opus"}:
+        return "audio/ogg"
+    if suffix == ".webm":
+        return "audio/webm"
+    if suffix == ".mp4":
+        return "video/mp4"
+    return "application/octet-stream"
+
+
+def gemini_file_state_name(file_obj) -> str:
+    state = getattr(file_obj, "state", None)
+    if state is None:
+        return "ACTIVE"
+    name = getattr(state, "name", None)
+    if isinstance(name, str) and name:
+        return name.upper()
+    state_text = str(state or "").upper()
+    if "." in state_text:
+        state_text = state_text.split(".")[-1]
+    return state_text or "UNKNOWN"
+
+
+def wait_for_gemini_file_ready(file_obj, *, timeout_seconds: int = GEMINI_MEDIA_UPLOAD_TIMEOUT):
+    client = get_genai_client()
+    if not getattr(file_obj, "name", None):
+        return file_obj
+
+    deadline = time.time() + max(timeout_seconds, 5)
+    current = file_obj
+    while time.time() < deadline:
+        state_name = gemini_file_state_name(current)
+        if state_name in {"ACTIVE", "READY", "SUCCEEDED", "PROCESSED"}:
+            return current
+        if state_name in {"FAILED", "ERROR"}:
+            error_message = str(getattr(current, "error", "") or "Gemini media processing failed.")
+            raise RuntimeError(error_message)
+        time.sleep(max(GEMINI_FILE_READY_POLL_SECONDS, 0.5))
+        current = client.files.get(name=current.name)
+    raise RuntimeError("Gemini media processing timed out.")
+
+
+def transcribe_media_with_gemini(media_path: str) -> str:
+    client = get_genai_client()
+    genai = get_genai_module()
+    mime_type = infer_media_mime_type(media_path)
+    model_name = get_gemini_model_name()
+    logger.info(
+        "gemini-media-transcription | upload_started | model=%s | file=%s | mime_type=%s",
+        model_name,
+        Path(media_path).name,
+        mime_type,
+    )
+    uploaded_file = client.files.upload(file=media_path, config={"mime_type": mime_type})
+    uploaded_file = wait_for_gemini_file_ready(uploaded_file)
+    prompt = (
+        "You are a precise transcription assistant.\n"
+        "Transcribe only the spoken content from this media.\n"
+        "Do not include timestamps, speaker labels, markdown, headings, credits, URLs, hashtags, or commentary.\n"
+        "Ignore music-only sections, background noise, subscribe/follow prompts, and promotional slates.\n"
+        "Return plain transcript text only."
+    )
+    try:
+        file_uri = str(getattr(uploaded_file, "uri", "") or "")
+        media_part = (
+            genai.types.Part.from_uri(
+                file_uri=file_uri,
+                mime_type=str(getattr(uploaded_file, "mime_type", "") or mime_type),
+            )
+            if file_uri
+            else uploaded_file
+        )
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[media_part, prompt],
+        )
+    finally:
+        try:
+            if getattr(uploaded_file, "name", None):
+                client.files.delete(name=uploaded_file.name)
+        except Exception:
+            pass
+    transcript_text = getattr(response, "text", "").strip()
+    if not transcript_text:
+        raise RuntimeError("Gemini did not return any transcript text.")
+    return transcript_text
 
 
 def parse_retry_delay_seconds(message: str) -> int:
@@ -2110,8 +2212,8 @@ def download_audio_via_ytdlp(url: str, output_dir: str) -> str:
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-                "preferredquality": "192",
+                "preferredcodec": "mp3",
+                "preferredquality": "128",
             }
         ],
     }
@@ -2156,10 +2258,14 @@ def download_audio_via_ytdlp(url: str, output_dir: str) -> str:
             f"Could not download audio from that YouTube URL. Details: {error_text}"
         ) from exc
 
-    wav_files = sorted(output_dir_path.glob("downloaded*.wav"))
-    if not wav_files:
-        raise RuntimeError("Audio download completed, but no WAV file was produced.")
-    return str(wav_files[0])
+    audio_files = sorted(
+        list(output_dir_path.glob("downloaded*.mp3"))
+        + list(output_dir_path.glob("downloaded*.m4a"))
+        + list(output_dir_path.glob("downloaded*.wav"))
+    )
+    if not audio_files:
+        raise RuntimeError("Audio download completed, but no audio file was produced.")
+    return str(audio_files[0])
 
 
 def download_audio(url: str, output_dir: str) -> str:
@@ -2201,9 +2307,12 @@ def extract_audio_from_video(video_path: str, output_audio_path: str) -> str:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    model = get_whisper_model()
-    result = model.transcribe(audio_path, fp16=False, verbose=False)
-    return result.get("text", "")
+    return run_with_timeout(
+        "Gemini media transcription",
+        GEMINI_MEDIA_TRANSCRIPTION_TIMEOUT,
+        transcribe_media_with_gemini,
+        audio_path,
+    )
 
 
 def build_transcript_cache_key(source_identifier: str) -> str:
@@ -2284,7 +2393,7 @@ def transcribe_audio_with_fallback(
                 progress = min(70, 20 + int((index / max(total, 1)) * 45))
                 progress_callback(
                     "transcribing_audio",
-                    f"Transcribing audio part {index} of {total}...",
+                    f"Transcribing audio with Gemini ({index}/{total})...",
                     progress,
                 )
             last_error: Optional[Exception] = None
@@ -2299,7 +2408,15 @@ def transcribe_audio_with_fallback(
                 except Exception as exc:
                     last_error = exc
             if last_error is not None:
-                raise RuntimeError(f"Transcription failed for audio part {index} of {total}.") from last_error
+                logger.warning(
+                    "gemini-media-transcription | chunk_failed | chunk=%s/%s | file=%s | error=%s",
+                    index,
+                    total,
+                    Path(chunk_path).name,
+                    last_error,
+                )
+                if not transcript_parts:
+                    raise RuntimeError(f"Transcription failed for audio part {index} of {total}.") from last_error
 
     with profiler.stage("transcript_cleaning"):
         transcript = clean_source_text(" ".join(transcript_parts))
@@ -3118,7 +3235,7 @@ def analyze_media(
             with profiler.stage("source_fetch_download"):
                 audio_source_path = extract_audio_from_video(video_path, extracted_audio_path)
             if progress_callback:
-                progress_callback("transcribing_audio", "Transcribing extracted audio...", 35)
+                progress_callback("transcribing_audio", "Transcribing extracted audio with Gemini...", 35)
             try:
                 with profiler.stage("transcription"):
                     transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
@@ -3153,7 +3270,7 @@ def analyze_media(
         raise RuntimeError("No audio source provided or audio extraction failed")
 
     if progress_callback:
-        progress_callback("transcribing_audio", "Transcribing audio...", 35)
+        progress_callback("transcribing_audio", "Transcribing audio with Gemini...", 35)
     try:
         with profiler.stage("transcription"):
             transcript = transcribe_audio_with_fallback(audio_source_path, cache_key=transcript_cache_key, progress_callback=progress_callback)
@@ -3219,7 +3336,7 @@ def analyze_text_content(transcript: str, query: str = "Summarize the content", 
 def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress_callback=None) -> tuple[dict[str, str], str]:
     with tempfile.TemporaryDirectory(prefix="media-analyzer-youtube-fallback-") as temp_dir:
         if progress_callback:
-            progress_callback("audio_download", "Captions were not available. Downloading audio...", 38)
+            progress_callback("audio_download", "Downloading video audio for Gemini transcription...", 24)
         logger.info("youtube-analysis-stage | audio_download_started | url=%s", url)
         temp_audio_path = run_with_timeout(
             "Video download",
@@ -3230,7 +3347,7 @@ def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress
         )
         logger.info("youtube-analysis-stage | audio_download_success | url=%s", url)
         if progress_callback:
-            progress_callback("audio_fallback", "Transcribing audio in parts...", 52)
+            progress_callback("transcribing_audio", "Transcribing audio with Gemini...", 52)
         logger.info("youtube-analysis-stage | transcription_started | url=%s", url)
         return run_with_timeout(
             "Transcription fallback",
@@ -3257,12 +3374,11 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
         return cached
 
     metadata: dict[str, object] = {}
-    transcript_text = ""
     source_context = ""
     direct_failure: Optional[Exception] = None
 
     if progress_callback:
-        progress_callback("transcript_extraction", "Extracting video transcript...", 12)
+        progress_callback("audio_download", "Preparing video for Gemini transcription...", 12)
 
     with profiler.stage("source_fetch_download"):
         metadata = run_with_timeout("YouTube metadata analysis", 35, fetch_youtube_metadata, url)
@@ -3309,62 +3425,18 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
                 )
                 if progress_callback:
                     progress_callback(
-                        "transcript_extraction",
-                        "Direct video analysis took too long. Extracting transcript...",
+                        "audio_download",
+                        "Direct video analysis did not finish quickly. Switching to Gemini transcription...",
                         20,
                     )
-
-        with tempfile.TemporaryDirectory(prefix="yt-direct-analysis-") as temp_dir:
-            captions_error: Optional[Exception] = None
-            try:
-                logger.info("youtube-analysis-stage | transcript_extraction_started | url=%s", url)
-                with profiler.stage("transcription"):
-                    transcript_text = run_with_timeout("YouTube transcript fetch", min(30, YOUTUBE_TRANSCRIPT_TIMEOUT), fetch_youtube_transcript_text, url)
-                logger.info("youtube-analysis-stage | transcript_found | url=%s | source=api", url)
-            except Exception as transcript_exc:
-                logger.warning("youtube-analysis-stage | transcript_unavailable | url=%s | reason=%s", url, transcript_exc)
-                logger.warning(
-                    "youtube-transcript-fetch-failed | url=%s | error_type=%s | error=%s",
-                    url,
-                    transcript_exc.__class__.__name__,
-                    str(transcript_exc),
-                )
-                try:
-                    with profiler.stage("transcription"):
-                        transcript_text = run_with_timeout("YouTube subtitle fetch", min(30, YOUTUBE_SUBTITLE_TIMEOUT), fetch_youtube_subtitles_text, url, temp_dir)
-                    logger.info("youtube-analysis-stage | transcript_found | url=%s | source=subtitles", url)
-                except Exception as subtitle_exc:
-                    logger.warning("youtube-analysis-stage | transcript_unavailable | url=%s | reason=%s", url, subtitle_exc)
-                    logger.warning(
-                        "youtube-subtitle-fetch-failed | url=%s | error_type=%s | error=%s",
-                        url,
-                        subtitle_exc.__class__.__name__,
-                        str(subtitle_exc),
-                    )
-                    captions_error = subtitle_exc
-
-        if transcript_text.strip():
-            if progress_callback:
-                progress_callback("topic_generation", "Transcript found. Generating heading, summary, and topics...", 68)
-            with profiler.stage("transcript_cleaning"):
-                logger.info("youtube-analysis-stage | transcript_cleaned | url=%s", url)
-                source_context = build_youtube_source_text(metadata, transcript_text)
-            with profiler.stage("analysis_generation"):
-                logger.info("youtube-analysis-stage | gemini_analysis_started | url=%s", url)
-                analysis_input = build_chunk_safe_analysis_input(source_context, query or "Summarize the content", progress_callback=progress_callback)
-                chunks = chunk_text(analysis_input)
-                try:
-                    with profiler.stage("topic_analysis_context"):
-                        context = build_analysis_context(analysis_input, chunks, query or "Summarize the content")
-                except Exception:
-                    context = " ".join(chunks[:3])
-                result = gemini_rag(context, query or "Summarize the content", source_url=url)
-                logger.info("youtube-analysis-stage | gemini_analysis_success | url=%s", url)
-        else:
-            if not remote_media_fallback_available():
-                raise RuntimeError("We could not extract reliable content from this video. Please upload the audio/video file or try another link.") from captions_error or direct_failure
-            result, cleaned_transcript = analyze_youtube_via_transcription_fallback(url, query or "Summarize the content", progress_callback=progress_callback)
-            source_context = cleaned_transcript or source_context
+        if not remote_media_fallback_available() and not is_youtube_url(url):
+            raise RuntimeError("We could not extract reliable content from this video. Please upload the audio/video file or try another link.")
+        result, cleaned_transcript = analyze_youtube_via_transcription_fallback(
+            url,
+            query or "Summarize the content",
+            progress_callback=progress_callback,
+        )
+        source_context = build_youtube_source_text(metadata, cleaned_transcript or "")
 
     if progress_callback:
         progress_callback("finalizing_output", "Finalizing headline, summary, and topic list...", 94)
@@ -3496,28 +3568,15 @@ def serialize_job_status(job: Job) -> dict[str, object]:
                 "success": False,
                 "status": "failed",
                 "reason": "timeout",
-                "message": "We could not extract reliable content from this video. Please upload the video/audio file or try another link.",
-                "error": "We could not extract reliable content from this video. Please upload the video/audio file or try another link.",
+                "message": "We could not transcribe this video reliably. Please upload the audio/video file or try another link.",
+                "error": "We could not transcribe this video reliably. Please upload the audio/video file or try another link.",
                 "progress": {
                     **progress_payload,
                     "stage": "failed",
-                    "message": "We could not extract reliable content from this video. Please upload the video/audio file or try another link.",
+                    "message": "We could not transcribe this video reliably. Please upload the audio/video file or try another link.",
                 },
             }
-        if progress_payload["stage"] in {"direct_gemini", "transcript_extraction"} and stale_seconds >= YOUTUBE_DIRECT_ANALYSIS_TIMEOUT:
-            logger.info(
-                "analysis-job-stage-promote | job_id=%s | from=%s | to=%s | stale=%ss",
-                job.id,
-                progress_payload["stage"],
-                "transcript_extraction",
-                stale_seconds,
-            )
-            progress_payload = {
-                "stage": "transcript_extraction",
-                "message": "Direct video analysis took too long. Extracting transcript...",
-                "progress": max(progress_payload["progress"], 28),
-            }
-        elif progress_payload["stage"] == "transcript_extraction" and stale_seconds >= max(30, YOUTUBE_TRANSCRIPT_TIMEOUT):
+        if progress_payload["stage"] == "direct_gemini" and stale_seconds >= YOUTUBE_DIRECT_ANALYSIS_TIMEOUT:
             logger.info(
                 "analysis-job-stage-promote | job_id=%s | from=%s | to=%s | stale=%ss",
                 job.id,
@@ -3527,8 +3586,21 @@ def serialize_job_status(job: Job) -> dict[str, object]:
             )
             progress_payload = {
                 "stage": "audio_download",
-                "message": "Captions were not available. Downloading audio...",
-                "progress": max(progress_payload["progress"], 38),
+                "message": "Direct video analysis did not finish quickly. Switching to Gemini transcription...",
+                "progress": max(progress_payload["progress"], 24),
+            }
+        elif progress_payload["stage"] == "audio_download" and stale_seconds >= min(120, YOUTUBE_FALLBACK_TIMEOUT):
+            logger.info(
+                "analysis-job-stage-promote | job_id=%s | from=%s | to=%s | stale=%ss",
+                job.id,
+                progress_payload["stage"],
+                "transcribing_audio",
+                stale_seconds,
+            )
+            progress_payload = {
+                "stage": "transcribing_audio",
+                "message": "Transcribing audio with Gemini...",
+                "progress": max(progress_payload["progress"], 52),
             }
     if status == "finished":
         return {
@@ -3782,8 +3854,8 @@ def analyze_youtube_endpoint(payload: AnalyzeYouTubeRequest, request: Request) -
                     "jobId": job.id,
                     "status": "queued",
                     "progress": {
-                        "stage": "transcript_extraction",
-                        "message": "Extracting video transcript...",
+                        "stage": "audio_download",
+                        "message": "Preparing video for Gemini transcription...",
                         "progress": 6,
                     },
                 },
@@ -3949,8 +4021,8 @@ async def analyze_endpoint(
                     "jobId": job.id,
                     "status": "queued",
                     "progress": {
-                        "stage": "transcript_extraction" if is_youtube else "downloading_source",
-                        "message": "Extracting video transcript..." if is_youtube else "Preparing source...",
+                        "stage": "audio_download" if is_youtube else "downloading_source",
+                        "message": "Preparing video for Gemini transcription..." if is_youtube else "Preparing source...",
                         "progress": 5,
                     },
                 },

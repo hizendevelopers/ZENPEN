@@ -342,12 +342,12 @@ def test_generate_article_html_skips_proofread_in_fast_mode(monkeypatch):
     assert '<h2>Headline</h2>' in html
 
 
-def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch, tmp_path):
+def test_analyze_endpoint_uses_gemini_transcription_for_youtube(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Instagram link https://instagram.com/test', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'youtube-audio.mp3')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Systems, Planning, and National Coordination',
         'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
@@ -367,14 +367,13 @@ def test_analyze_endpoint_uses_transcript_fallback_for_youtube(monkeypatch, tmp_
     assert payload['result']['topics'] == ['Coordinated Systems']
 
 
-def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch, tmp_path):
+def test_analyze_endpoint_uses_audio_download_for_youtube(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.background_url_jobs_available', lambda: False)
     download_calls = {'count': 0}
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: download_calls.__setitem__('count', download_calls['count'] + 1) or 'fake-audio.wav')
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: download_calls.__setitem__('count', download_calls['count'] + 1) or 'fake-audio.mp3')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Systems, Planning, and National Coordination',
         'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
@@ -391,7 +390,7 @@ def test_analyze_endpoint_prefers_youtube_transcript_before_download(monkeypatch
     payload = response.json()
     assert payload['success'] is True
     assert payload['result']['topics'] == ['Coordinated Systems']
-    assert download_calls['count'] == 0
+    assert download_calls['count'] == 1
 
 
 def test_health_endpoint():
@@ -604,8 +603,8 @@ def test_download_audio_uses_apify_when_ytdlp_fails(monkeypatch, tmp_path):
 def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.mp3')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Systems, Planning, and National Coordination',
         'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
@@ -625,9 +624,8 @@ def test_analyze_url_source_returns_topics_without_articles(monkeypatch, tmp_pat
 def test_analyze_url_source_downloads_and_transcribes_youtube(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel', 'categories': ['News'], 'tags': ['Policy']})
-    monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('unsupported direct analysis')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
-    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.mp3')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Systems, Planning, and National Coordination',
         'summary': 'The video argues that coordinated institutions and long-term planning drive national transformation.',
@@ -664,10 +662,7 @@ def test_analyze_youtube_source_falls_back_when_direct_analysis_fails(monkeypatc
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel'})
     monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(RuntimeError('direct failed')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(RuntimeError('no transcript')))
-    monkeypatch.setattr('app.fetch_youtube_subtitles_text', lambda url, output_dir: (_ for _ in ()).throw(RuntimeError('no subtitles')))
-    monkeypatch.setattr('app.remote_media_fallback_available', lambda: True)
-    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.wav')
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.mp3')
     monkeypatch.setattr('app.transcribe_audio', lambda _: 'Recovered transcript from fallback path.')
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Recovered analysis',
@@ -692,12 +687,13 @@ def test_build_youtube_source_text_does_not_use_description_as_transcript():
     assert 'follow us' not in text.lower()
 
 
-def test_analyze_youtube_source_prefers_transcript_first_by_default(monkeypatch, tmp_path):
+def test_analyze_youtube_source_uses_gemini_transcription_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr('app.ANALYSIS_CACHE_DIR', tmp_path / 'analysis-cache')
     monkeypatch.setattr('app.ENABLE_DIRECT_GEMINI_YOUTUBE_ANALYSIS', False)
     monkeypatch.setattr('app.fetch_youtube_metadata', lambda url: {'title': 'Video headline', 'description': 'Video description', 'channel': 'Channel'})
     monkeypatch.setattr('app.direct_gemini_youtube_analysis', lambda url, query, metadata=None: (_ for _ in ()).throw(AssertionError('direct analysis should be skipped by default')))
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: LONG_VIDEO_TRANSCRIPT)
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: 'fake-audio.mp3')
+    monkeypatch.setattr('app.transcribe_audio', lambda _: LONG_VIDEO_TRANSCRIPT)
     monkeypatch.setattr('app.gemini_rag', lambda context, query, source_url='': {
         'heading': 'Transcript heading',
         'summary': 'Transcript summary.',
@@ -722,7 +718,7 @@ def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_
         'key_points': ['Point one'],
         'topics': [{'title': 'Direct Topic', 'points': [{'label': 'Point', 'description': 'Direct path worked.'}]}],
     })
-    monkeypatch.setattr('app.fetch_youtube_transcript_text', lambda url: (_ for _ in ()).throw(AssertionError('transcript should not run')))
+    monkeypatch.setattr('app.download_audio', lambda url, output_dir: (_ for _ in ()).throw(AssertionError('audio download should not run')))
 
     result = analyze_youtube_source('https://www.youtube.com/watch?v=abc123', 'Summarize')
 
@@ -731,7 +727,7 @@ def test_analyze_youtube_source_returns_direct_gemini_result_without_transcript_
     assert result['direct_analysis'] is True
 
 
-def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_transcript_extraction(monkeypatch):
+def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_audio_download(monkeypatch):
     class FakeJob:
         id = 'job-1'
         meta = {
@@ -748,8 +744,8 @@ def test_serialize_job_status_promotes_stale_direct_gemini_jobs_to_transcript_ex
     monkeypatch.setattr('app.time.time', lambda: 900000 + YOUTUBE_DIRECT_ANALYSIS_TIMEOUT + 5)
     payload = serialize_job_status(FakeJob())
     assert payload['status'] == 'started'
-    assert payload['progress']['stage'] == 'transcript_extraction'
-    assert 'Extracting transcript' in payload['progress']['message']
+    assert payload['progress']['stage'] == 'audio_download'
+    assert 'Gemini transcription' in payload['progress']['message']
 
 
 def test_serialize_job_status_marks_overall_job_timeout_as_failed(monkeypatch):
@@ -845,7 +841,7 @@ def test_analyze_endpoint_queues_url_job_when_background_workers_are_available(m
     assert payload['success'] is True
     assert payload['queued'] is True
     assert payload['jobId'] == 'job-123'
-    assert payload['progress']['stage'] == 'transcript_extraction'
+    assert payload['progress']['stage'] == 'audio_download'
 
 
 def test_job_status_endpoint_returns_completed_result(monkeypatch):

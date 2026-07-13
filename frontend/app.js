@@ -58,7 +58,6 @@ const appState = {
   formValues: {
     url: '',
     query: 'Give breaking news and main points',
-    transcriptText: '',
     articleCount: '1',
     articleType: 'Blog Article',
     targetAudience: 'General readers',
@@ -253,12 +252,12 @@ function mapUserFacingError(error) {
   if (lower.includes('unsupported')) return 'That source type is not supported for this action.';
   if (lower.includes('video could not be downloaded')) return 'Video could not be downloaded. The source may be private or unavailable.';
   if (lower.includes('source is private or unavailable')) return 'Source is private or unavailable.';
-  if (lower.includes('gemini could not analyze the video directly')) return 'Direct video analysis failed. Extracting transcript...';
-  if (lower.includes('direct video analysis took too long')) return 'Direct video analysis took too long. Extracting transcript...';
+  if (lower.includes('gemini could not analyze the video directly')) return 'Direct video analysis failed. Switching to Gemini transcription...';
+  if (lower.includes('direct video analysis took too long')) return 'Direct video analysis took too long. Switching to Gemini transcription...';
   if (lower.includes('transcription failed')) return 'Transcription failed. Please try another source or upload the audio/video file directly.';
   if (lower.includes('captions were not available')) return 'Captions were not available. Trying audio transcription...';
-  if (lower.includes('upload the video/audio file or try another link')) return 'We could not extract the video automatically. You can upload the audio/video file or paste the transcript manually.';
-  if (lower.includes('youtube blocked automated extraction')) return 'YouTube blocked automated extraction for this video. Please upload audio/video or paste transcript.';
+  if (lower.includes('upload the audio/video file or try another link') || lower.includes('could not extract reliable content from this video')) return 'We could not extract the video automatically. Please upload the audio/video file or try another link.';
+  if (lower.includes('youtube blocked automated extraction')) return 'YouTube blocked automated extraction for this video. Please upload the audio/video file.';
   if (lower.includes('website blocked automated access')) return 'The website blocked automated access. Please try another public URL.';
   if (lower.includes('could not provide transcript or subtitle text quickly enough')) return 'Direct video analysis failed. Trying audio transcription fallback...';
   if (lower.includes('youtube video cannot be accessed')) return 'This YouTube video cannot be processed right now. Please try another source or upload the file.';
@@ -290,8 +289,8 @@ function startBusyStatusTimer(mode) {
   stopBusyStatusTimer();
   const stagesByMode = {
     analyzing: [
-      { delay: 8000, message: 'Extracting video transcript...' },
-      { delay: 22000, message: 'We are still extracting source content...' },
+      { delay: 8000, message: 'Downloading video audio for Gemini transcription...' },
+      { delay: 22000, message: 'Transcribing source with Gemini...' },
     ],
     articles: [
       { delay: 8000, message: 'Polishing article...' },
@@ -320,7 +319,6 @@ function syncSourceInputs() {
   if (!form) return;
   const urlInput = form.querySelector('#url-input');
   const fileInput = form.querySelector('#file-input');
-  const transcriptInput = form.querySelector('#transcript-input');
   const fileHelper = form.querySelector('#file-helper');
   const urlHelper = form.querySelector('#url-helper');
   const clearUrlButton = form.querySelector('[data-action="clear-url"]');
@@ -329,22 +327,17 @@ function syncSourceInputs() {
 
   const hasUrl = Boolean(urlInput.value.trim());
   const hasFile = Boolean(fileInput.files?.length);
-  const hasTranscript = transcriptInput instanceof HTMLTextAreaElement && Boolean(transcriptInput.value.trim());
 
-  urlInput.disabled = hasFile || hasTranscript;
-  fileInput.disabled = hasUrl || hasTranscript;
+  urlInput.disabled = hasFile;
+  fileInput.disabled = hasUrl;
 
   if (fileHelper) {
-    fileHelper.textContent = hasTranscript
-      ? 'Clear the pasted transcript if you want to switch to file upload.'
-      : hasUrl
+    fileHelper.textContent = hasUrl
       ? 'Clear the URL if you want to switch to file upload.'
       : 'Select an audio or video file if you do not want to use a URL.';
   }
   if (urlHelper) {
-    urlHelper.textContent = hasTranscript
-      ? 'Clear the pasted transcript if you want to switch back to a URL.'
-      : hasFile
+    urlHelper.textContent = hasFile
       ? 'Reset the selected file if you want to switch back to a URL.'
       : 'Paste a webpage or YouTube/video URL.';
   }
@@ -775,13 +768,6 @@ function buildAnalysisSummary() {
         <div class="error-actions-row">
           <button class="ghost-btn" data-action="retry-analysis">Retry</button>
         </div>
-        <div class="manual-transcript-box">
-          <label>
-            Paste transcript manually
-            <textarea id="transcript-textarea" name="transcriptText" rows="7" placeholder="Paste the video transcript here if automatic YouTube extraction fails.">${escapeHtml(appState.formValues.transcriptText || '')}</textarea>
-          </label>
-          <button class="primary-btn" type="button" data-action="analyze-pasted-transcript" ${appState.busyMode === 'analyzing' ? 'disabled' : ''}>Analyze Pasted Transcript</button>
-        </div>
       </div>
     `;
   }
@@ -953,12 +939,8 @@ function buildArticleGeneratorPage() {
             Analysis prompt
             <input id="query-input" name="query" type="text" value="${escapeHtml(appState.formValues.query)}" placeholder="Tell us what you want from this video or URL, e.g. 'Give me breaking news and main points'" />
           </label>
-          <label>
-            Paste transcript manually
-            <textarea id="transcript-input" name="transcriptText" rows="6" placeholder="If YouTube extraction fails, paste the transcript here and analyze it directly.">${escapeHtml(appState.formValues.transcriptText || '')}</textarea>
-          </label>
           <button class="primary-btn wide-btn" type="submit" ${appState.busyMode === 'analyzing' ? 'disabled' : ''}>Analyze Content</button>
-          <p class="field-helper">Supported direct inputs: webpages, article URLs, YouTube/video links, uploaded audio/video files, or a pasted transcript. Image URLs are not supported yet.</p>
+          <p class="field-helper">Supported direct inputs: webpages, article URLs, YouTube/video links, and uploaded audio/video files. Image URLs are not supported yet.</p>
         </form>
       </div>
 
@@ -1024,10 +1006,7 @@ function renderApp() {
 }
 
 function validateAnalysisInput(url, file) {
-  const transcriptText = (appState.formValues.transcriptText || '').trim();
-  if (!url && !file && !transcriptText) return 'Please provide a URL, upload an audio/video file, or paste a transcript.';
-  const sourceCount = Number(Boolean(url)) + Number(Boolean(file)) + Number(Boolean(transcriptText));
-  if (sourceCount > 1) return 'Please use one source at a time: URL, upload, or pasted transcript.';
+  if (!url && !file) return 'Please provide a URL or upload an audio/video file.';
   if (url) {
     try {
       new URL(url);
@@ -1057,7 +1036,6 @@ async function sendAnalyzeRequest({ generateArticle, selectedTopics, source, end
   if (source.url) formData.append('url', source.url);
   if (source.query) formData.append('query', source.query);
   if (source.file) formData.append('file', source.file);
-  if (source.transcriptText) formData.append('transcript_text', source.transcriptText);
   formData.append('generate_article', generateArticle ? 'true' : 'false');
   formData.append('article_count', appState.formValues.articleCount || '1');
   formData.append('article_type', appState.formValues.articleType || 'Blog Article');
@@ -1278,7 +1256,6 @@ async function handleAnalyzeSubmit(form) {
   const fileInput = form.querySelector('#file-input');
   const url = form.querySelector('#url-input').value.trim();
   const query = form.querySelector('#query-input').value.trim() || 'Give breaking news and main points';
-  const transcriptText = (form.querySelector('#transcript-input')?.value || appState.formValues.transcriptText || '').trim();
   const file = fileInput?.files?.[0] || null;
   const validationMessage = validateAnalysisInput(url, file);
   if (validationMessage) {
@@ -1292,25 +1269,22 @@ async function handleAnalyzeSubmit(form) {
   appState.sourceMode = sourceMode;
   appState.formValues.url = url;
   appState.formValues.query = query;
-  appState.formValues.transcriptText = transcriptText;
   appState.analysisError = '';
   appState.articleError = '';
   appState.publishError = '';
   appState.successMessage = '';
   appState.busyMode = 'analyzing';
-  const youtubeMode = !transcriptText && sourceMode !== 'upload' && url && /youtu(\.be|be\.com)/i.test(url);
+  const youtubeMode = sourceMode !== 'upload' && url && /youtu(\.be|be\.com)/i.test(url);
   appState.busyMessage = sourceMode === 'upload'
-    ? 'Uploading your media and preparing transcription...'
-    : transcriptText
-      ? 'Cleaning transcript...'
+    ? 'Uploading your media for Gemini transcription...'
     : youtubeMode
-      ? 'Extracting video transcript...'
+      ? 'Downloading video audio for Gemini transcription...'
       : 'Preparing source and extracting content...';
   startBusyStatusTimer('analyzing');
   renderApp();
 
     try {
-      const source = { url, query, file, transcriptText };
+      const source = { url, query, file };
       appState.lastSubmission = source;
       const payload = await sendAnalyzeRequest({
         generateArticle: false,
@@ -1320,7 +1294,7 @@ async function handleAnalyzeSubmit(form) {
       });
       if (payload.queued && payload.jobId) {
         appState.busyMode = 'analyzing';
-        appState.busyMessage = payload.progress?.message || 'Extracting video transcript...';
+        appState.busyMessage = payload.progress?.message || 'Downloading video audio for Gemini transcription...';
         appState.activeJobStage = payload.progress?.stage || '';
         startAnalysisPolling(payload.jobId);
         renderApp();
@@ -1521,10 +1495,6 @@ function attachDelegatedHandlers() {
       if (target.id === 'query-input') {
         appState.formValues.query = target.value;
       }
-      if (target.id === 'transcript-input' || target.id === 'transcript-textarea') {
-        appState.formValues.transcriptText = target.value;
-        syncSourceInputs();
-      }
     }
   });
 
@@ -1573,15 +1543,6 @@ function attachDelegatedHandlers() {
         if (form) {
           handleAnalyzeSubmit(form);
         }
-      }
-      return;
-    }
-
-    if (button.dataset.action === 'analyze-pasted-transcript') {
-      appState.analysisError = '';
-      const form = document.getElementById('article-generator-form');
-      if (form) {
-        handleAnalyzeSubmit(form);
       }
       return;
     }

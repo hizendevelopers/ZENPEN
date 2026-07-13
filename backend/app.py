@@ -1168,7 +1168,7 @@ def fetch_youtube_transcript_text(url: str) -> str:
 
     transcript_api = build_transcript_api_instance()
     try:
-        transcript_entries = transcript_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
+        transcript_entries = transcript_api.fetch(video_id, languages=["en", "en-US", "en-GB", "ur", "hi"])
     except Exception:
         transcript_entries = transcript_api.fetch(video_id)
 
@@ -1210,6 +1210,13 @@ def fetch_youtube_metadata(url: str) -> dict[str, object]:
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = normalize_yt_info_entry(ydl.extract_info(url, download=False))
+    except yt_dlp.utils.DownloadError as exc:
+        error_text = str(exc)
+        if "Video unavailable" in error_text:
+            raise RuntimeError(
+                "This YouTube link appears unavailable or copied incorrectly. Please open the video again and copy the full link."
+            ) from exc
+        raise RuntimeError(f"Could not load YouTube video details. {error_text}") from exc
     finally:
         shutil.rmtree(output_dir, ignore_errors=True)
     return {
@@ -1901,7 +1908,7 @@ def fetch_youtube_subtitles_text(url: str, output_dir: str) -> str:
             "skip_download": True,
             "writesubtitles": True,
             "writeautomaticsub": True,
-            "subtitleslangs": ["en", "en-US", "en-GB"],
+            "subtitleslangs": ["en", "en-US", "en-GB", "ur", "hi", "a.en", "a.hi", "a.ur", "live_chat"],
             "subtitlesformat": "vtt",
             "outtmpl": str(output_dir_path / "subtitle-download.%(ext)s"),
             "quiet": True,
@@ -3361,6 +3368,55 @@ def analyze_youtube_via_transcription_fallback(url: str, query: str, *, progress
         )
 
 
+def analyze_youtube_via_subtitles(url: str, query: str, metadata: dict[str, object], *, progress_callback=None) -> Optional[tuple[dict[str, object], str]]:
+    with tempfile.TemporaryDirectory(prefix="yt-subtitles-") as temp_dir:
+        try:
+            if progress_callback:
+                progress_callback("subtitle_extraction", "Extracting real video captions...", 22)
+            logger.info("youtube-analysis-stage | subtitle_extraction_started | url=%s", url)
+            subtitle_text = run_with_timeout(
+                "YouTube subtitle fetch",
+                min(45, YOUTUBE_SUBTITLE_TIMEOUT + 15),
+                fetch_youtube_subtitles_text,
+                url,
+                temp_dir,
+            )
+        except Exception as subtitle_exc:
+            logger.warning(
+                "youtube-analysis-stage | subtitle_extraction_failed | url=%s | error_type=%s | error=%s",
+                url,
+                subtitle_exc.__class__.__name__,
+                str(subtitle_exc),
+            )
+            return None
+
+    cleaned_transcript = clean_source_text(subtitle_text)
+    if not cleaned_transcript.strip():
+        return None
+    if progress_callback:
+        progress_callback("topic_generation", "Captions found. Generating heading, summary, and topics...", 68)
+    logger.info("youtube-analysis-stage | subtitle_extraction_success | url=%s | chars=%s", url, len(cleaned_transcript))
+    source_context = build_youtube_source_text(metadata, cleaned_transcript)
+    analysis_input = build_chunk_safe_analysis_input(source_context, query or "Summarize the content", progress_callback=progress_callback)
+    chunks = chunk_text(analysis_input)
+    try:
+        context = build_analysis_context(analysis_input, chunks, query or "Summarize the content")
+    except Exception:
+        context = " ".join(chunks[:3])
+    try:
+        result = gemini_rag(context, query or "Summarize the content", source_url=url)
+        logger.info("youtube-analysis-stage | gemini_analysis_success | url=%s | source=subtitles", url)
+    except Exception as exc:
+        logger.warning(
+            "youtube-analysis-stage | gemini_analysis_failed | url=%s | source=subtitles | error_type=%s | error=%s",
+            url,
+            exc.__class__.__name__,
+            str(exc),
+        )
+        result = fallback_summary(cleaned_transcript, query or "Summarize the content")
+    return result, cleaned_transcript
+
+
 def analyze_youtube_source(url: str, query: str = "Summarize the content", *, progress_callback=None) -> dict[str, object]:
     profiler = StageProfiler(f"youtube-analysis:{url}")
     video_id = extract_youtube_video_id(url) or "unknown"
@@ -3429,14 +3485,23 @@ def analyze_youtube_source(url: str, query: str = "Summarize the content", *, pr
                         "Direct video analysis did not finish quickly. Switching to Gemini transcription...",
                         20,
                     )
-        if not remote_media_fallback_available() and not is_youtube_url(url):
-            raise RuntimeError("We could not extract reliable content from this video. Please upload the audio/video file or try another link.")
-        result, cleaned_transcript = analyze_youtube_via_transcription_fallback(
-            url,
-            query or "Summarize the content",
-            progress_callback=progress_callback,
-        )
-        source_context = build_youtube_source_text(metadata, cleaned_transcript or "")
+        with profiler.stage("transcription"):
+            subtitle_result = analyze_youtube_via_subtitles(
+                url,
+                query or "Summarize the content",
+                metadata,
+                progress_callback=progress_callback,
+            )
+        if subtitle_result:
+            result, cleaned_transcript = subtitle_result
+            source_context = build_youtube_source_text(metadata, cleaned_transcript or "")
+        else:
+            result, cleaned_transcript = analyze_youtube_via_transcription_fallback(
+                url,
+                query or "Summarize the content",
+                progress_callback=progress_callback,
+            )
+            source_context = build_youtube_source_text(metadata, cleaned_transcript or "")
 
     if progress_callback:
         progress_callback("finalizing_output", "Finalizing headline, summary, and topic list...", 94)
